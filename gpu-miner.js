@@ -10,13 +10,14 @@ const crypto = require("crypto");
 const RPC_URL = process.env.RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc";
-const MAX_GAS_GWEI = parseFloat(process.env.MAX_GAS_GWEI || "20");
+const MAX_GAS_GWEI = parseFloat(process.env.MAX_GAS_GWEI || "50");
 const GAS_LIMIT = parseInt(process.env.GAS_LIMIT || "300000", 10);
 const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || "2000", 10);
-const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "2");
-const GAS_REFRESH_MS = parseInt(process.env.GAS_REFRESH_MS || "12000", 10);
+const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "5");
+const GAS_REFRESH_MS = parseInt(process.env.GAS_REFRESH_MS || "4000", 10);
 const STATS_INTERVAL = parseInt(process.env.STATS_INTERVAL || "15000", 10);
-const TX_TIMEOUT = parseInt(process.env.TX_TIMEOUT || "60000", 10);
+const TX_TIMEOUT = parseInt(process.env.TX_TIMEOUT || "45000", 10);
+const MAX_PENDING = parseInt(process.env.MAX_PENDING || "2", 10);
 
 const ABI = [
   "function getChallenge(address miner) view returns (bytes32)",
@@ -38,8 +39,9 @@ const stats = {
   startTime: Date.now(),
   solutionsFound: 0,
   txSent: 0,
-  txSuccess: 0,
-  txFailed: 0,
+  txMined: 0,       // receipt.status === 1 (rewarded!)
+  txReverted: 0,     // receipt.status === 0 (someone else got it)
+  txFailed: 0,       // send error, nonce conflict, etc
   txPending: 0,
   roundsCompleted: 0,
   lastGpuHashrate: "N/A",
@@ -66,9 +68,10 @@ function printStats() {
   const uptime = formatUptime(Date.now() - stats.startTime);
   const hr = stats.lastGpuHashrate;
   const sent = stats.txSent;
-  const ok = stats.txSuccess;
-  const fail = stats.txFailed;
-  const confirmRate = sent > 0 ? ((ok / sent) * 100).toFixed(0) : "0";
+  const mined = stats.txMined;
+  const reverted = stats.txReverted;
+  const failed = stats.txFailed;
+  const successRate = sent > 0 ? ((mined / sent) * 100).toFixed(0) : "0";
 
   console.log();
   console.log(`┌─────────────────────────────────────────────────────────────────┐`);
@@ -76,9 +79,10 @@ function printStats() {
   console.log(`├─────────────────────────────────────────────────────────────────┤`);
   console.log(`│  ⚡ Hashrate    ${S(hr, 20)}│ 🕐 Uptime   ${S(uptime, 18)}│`);
   console.log(`│  🔄 Rounds      ${S(stats.roundsCompleted, 20)}│ 🎯 Found    ${S(stats.solutionsFound, 18)}│`);
-  console.log(`│  📤 TX Sent     ${S(sent, 20)}│ ✅ Confirmed ${S(ok, 18)}│`);
-  console.log(`│  ❌ Failed      ${S(fail, 20)}│ ⏳ Pending   ${S(stats.txPending, 18)}│`);
-  console.log(`│  ⛽ Gas-skipped ${S(stats.gasSkipped, 20)}│ 📈 Confirm % ${S(confirmRate + "%", 18)}│`);
+  console.log(`│  📤 TX Sent     ${S(sent, 20)}│ ✅ Rewarded  ${S(mined, 18)}│`);
+  console.log(`│  ⏮️ Reverted    ${S(reverted, 20)}│ ❌ Failed    ${S(failed, 18)}│`);
+  console.log(`│  ⏳ Pending     ${S(stats.txPending, 20)}│ ⛽ Skipped   ${S(stats.gasSkipped, 18)}│`);
+  console.log(`│  📈 Success %   ${S(successRate + "%", 51)}│`);
   console.log(`├─────────────────────────────────────────────────────────────────┤`);
   console.log(`│  🪙 HASH Balance: ${S(stats.lastHashBal, 48)}│`);
   console.log(`│  💰 ETH Balance:  ${S(stats.lastEthBal, 48)}│`);
@@ -117,7 +121,6 @@ async function refreshGas(provider) {
     const baseFee = feeData.gasPrice || 0n;
     const baseGwei = parseFloat(ethers.formatUnits(baseFee, "gwei"));
     const priorityFee = ethers.parseUnits(PRIORITY_FEE_GWEI.toString(), "gwei");
-    // maxFee = base * 2 + priority (generous buffer for spikes)
     const maxFee = baseFee * 2n + priorityFee;
     cachedGas = { baseGwei, maxFeePerGas: maxFee, maxPriorityFeePerGas: priorityFee, type: 2, ts: Date.now() };
   } catch {}
@@ -128,11 +131,10 @@ async function getGasParams(provider) {
   return cachedGas;
 }
 
-// ─── Submit + Wait for Confirmation ──────────────────────────────────────────
-// KEY FIX: We WAIT for TX to confirm before submitting next one.
-// This prevents nonce chain clog (50 pending, 0 confirmed).
-// Mining continues in parallel — only TX submission is serialized.
-async function submitAndWait(contract, provider, nonce, gasParams, hashHex) {
+// ─── Fire-and-forget TX submit ───────────────────────────────────────────────
+// Sends TX immediately, polls receipt in background (non-blocking)
+// Max 2 pending TXs to avoid nonce chain clog
+async function fireAndForget(contract, provider, wallet, nonce, gasParams, hashHex) {
   stats.txSent++;
   stats.txPending++;
   const shortHash = hashHex.slice(0, 10) + "…";
@@ -148,32 +150,78 @@ async function submitAndWait(contract, provider, nonce, gasParams, hashHex) {
     const shortTx = tx.hash.slice(0, 10) + "…";
     log(`📤 ${shortHash} → ${shortTx}  [etherscan.io/tx/${tx.hash}]`);
 
-    // WAIT for receipt — this is the key difference
-    const receipt = await provider.waitForTransaction(tx.hash, 1, TX_TIMEOUT);
+    // Background receipt poll — non-blocking
+    pollReceipt(provider, contract, tx.hash, shortHash, shortTx);
 
-    if (receipt) {
-      stats.txSuccess++;
-      stats.txPending--;
-      log(`✅ ${shortTx} confirmed in block ${receipt.blockNumber}  [${stats.txSuccess}/${stats.txSent}]`);
-    } else {
-      stats.txFailed++;
-      stats.txPending--;
-      log(`⏭️ ${shortTx} receipt null — TX may have failed`);
-    }
+    return true;
   } catch (err) {
     stats.txFailed++;
     stats.txPending--;
     const msg = err.shortMessage || err.message || String(err);
-    if (msg.includes("InsufficientWork") || msg.includes("already mined")) {
-      log(`⏭️ ${shortHash} already mined — skipped`);
-    } else if (msg.includes("nonce")) {
+    if (msg.includes("nonce")) {
       log(`⏭️ ${shortHash} nonce conflict — skipping`);
-    } else if (msg.includes("timeout") || msg.includes("Timed out")) {
-      log(`⏱️ ${shortHash} TX timeout (${TX_TIMEOUT / 1000}s) — may still confirm`);
     } else {
-      log(`❌ ${shortHash} error: ${msg.slice(0, 80)}`);
+      log(`❌ ${shortHash} TX error: ${msg.slice(0, 80)}`);
     }
+    return false;
   }
+}
+
+// ─── Background receipt poll ─────────────────────────────────────────────────
+function pollReceipt(provider, contract, txHash, shortHash, shortTx) {
+  const startTime = Date.now();
+
+  const poll = async () => {
+    try {
+      const receipt = await provider.getTransactionReceipt(txHash);
+
+      if (receipt) {
+        stats.txPending--;
+
+        if (receipt.status === 1) {
+          stats.txMined++;
+          log(`✅ ${shortTx} REWARDED in block ${receipt.blockNumber}  [${stats.txMined}/${stats.txSent}]`);
+          // Refresh HASH balance
+          try {
+            const bal = await contract.balanceOf(walletAddress);
+            stats.lastHashBal = ethers.formatUnits(bal, 18);
+          } catch {}
+        } else {
+          stats.txReverted++;
+          log(`⏮️ ${shortTx} REVERTED in block ${receipt.blockNumber} — too slow  [${stats.txMined}/${stats.txSent}]`);
+        }
+        return;
+      }
+
+      if (Date.now() - startTime < TX_TIMEOUT) {
+        setTimeout(poll, 2000);
+      } else {
+        stats.txPending--;
+        stats.txFailed++;
+        log(`⏱️ ${shortTx} timeout ${TX_TIMEOUT / 1000}s — may still confirm`);
+      }
+    } catch {
+      if (Date.now() - startTime < TX_TIMEOUT) {
+        setTimeout(poll, 3000);
+      } else {
+        stats.txPending--;
+      }
+    }
+  };
+
+  setTimeout(poll, 3000);
+}
+
+// ─── Wait for pending slot ───────────────────────────────────────────────────
+function waitForSlot() {
+  return new Promise((resolve) => {
+    const check = setInterval(() => {
+      if (stats.txPending < MAX_PENDING) {
+        clearInterval(check);
+        resolve();
+      }
+    }, 1000);
+  });
 }
 
 // ─── Parallel RPC ────────────────────────────────────────────────────────────
@@ -209,6 +257,8 @@ function runGpuMiner(binaryPath, challengeHex, difficultyHex, startNonce) {
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
+let walletAddress = ""; // global for receipt poll balance refresh
+
 async function main() {
   requireEnv();
 
@@ -220,16 +270,15 @@ async function main() {
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
   const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
   const binaryPath = getGpuBinary();
+  walletAddress = wallet.address;
 
-  // ─── Startup ────────────────────────────────────────────────────────────────
   console.log();
   log(`🔑 Wallet:   ${wallet.address}`);
   log(`📄 Contract: ${CONTRACT_ADDRESS}`);
   log(`⛽ Gas:      max ${MAX_GAS_GWEI} gwei | priority ${PRIORITY_FEE_GWEI} gwei`);
-  log(`⏱️ TX timeout: ${TX_TIMEOUT / 1000}s`);
+  log(`📊 Strategy: fire-and-forget × ${MAX_PENDING} concurrent + receipt status check`);
   log(`⚡ GPU:      Starting 1 GPU thread(s). Ctrl+C to stop.`);
 
-  // Pre-flight
   const [balance, gasParams] = await Promise.all([
     provider.getBalance(wallet.address),
     getGasParams(provider),
@@ -253,8 +302,6 @@ async function main() {
   setTimeout(printStats, 10_000);
 
   // ─── Mining Loop ────────────────────────────────────────────────────────────
-  // Mining runs continuously. TX submission blocks until confirmed.
-  // This prevents nonce chain clog — at most 1 TX pending at a time.
   while (true) {
     try {
       const [{ state, challenge }, gasParams] = await Promise.all([
@@ -297,9 +344,14 @@ async function main() {
           const shortHash = hashHex.slice(0, 10) + "…";
           log(`⛽ ${shortHash} skipped — gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei`);
         } else {
-          // SUBMIT + WAIT — blocks until TX confirmed or timeout
-          // This ensures we never pile up nonces
-          await submitAndWait(contract, provider, nonce, gasParams, hashHex);
+          // Wait for slot if max pending reached
+          if (stats.txPending >= MAX_PENDING) {
+            log(`⏳ ${stats.txPending} pending TXs — waiting for slot...`);
+            await waitForSlot();
+          }
+
+          // Fire-and-forget: submit TX and immediately mine next
+          await fireAndForget(contract, provider, wallet, nonce, gasParams, hashHex);
         }
       }
 
