@@ -1,12 +1,11 @@
 /*  gpu-miner.cu  —  Multi-GPU CUDA keccak-256 nonce finder for HASH256
  *
- *  Optimized for: 2x RTX 4090 (Ada Lovelace, SM 8.9, 128 SMs each)
- *  Also works on: H100, A100, RTX 30xx/40xx, V100, etc.
+ *  Works on: RTX 5090 (Blackwell sm_120), RTX 4090 (Ada sm_89), H100 (Hopper sm_90)
  *
  *  Usage:  ./gpu-miner <challenge_hex_64chars> <difficulty_hex_64chars> [start_nonce]
  *  Output: JSON to stdout on success, status to stderr
  *
- *  Build:  nvcc -O3 -arch=sm_89 --use_fast_math -o gpu-miner gpu-miner.cu -lcudart
+ *  Build:  nvcc -O3 -arch=sm_120 --use_fast_math -o gpu-miner gpu-miner.cu -lcudart -lpthread
  */
 
 #include <cstdio>
@@ -63,8 +62,7 @@ static void keccak_f1600_host(uint64_t s[25]) {
             tmp[h_PI[i]] = h_rotl64(s[i], h_RHO[i]);
         for (int y = 0; y < 5; y++)
             for (int x = 0; x < 5; x++)
-                s[x + 5*y] = tmp[x + 5*y]
-                            ^ ((~tmp[(x+1)%5 + 5*y]) & tmp[(x+2)%5 + 5*y]);
+                s[x + 5*y] = tmp[x + 5*y] ^ ((~tmp[(x+1)%5 + 5*y]) & tmp[(x+2)%5 + 5*y]);
         s[0] ^= h_RC[r];
     }
 }
@@ -117,22 +115,21 @@ static uint64_t bytes_to_u64_be(const uint8_t* b) {
          | ((uint64_t)b[4]<<24)|((uint64_t)b[5]<<16)|((uint64_t)b[6]<<8)|(uint64_t)b[7];
 }
 
-/* ── Byte swap ─────────────────────────────────────────────────────────── */
+/* ── Device constants ──────────────────────────────────────────────────── */
+
+__constant__ uint64_t d_RC[24];
+__constant__ int d_RHO[25];
+__constant__ int d_PI[25];
+
+/* ── Device keccak-f[1600] ─────────────────────────────────────────────── */
 
 __device__ __forceinline__ uint64_t bswap64(uint64_t x) {
     return __byte_perm(x, 0, 0x0123);
 }
 
-/* ── Device keccak-f[1600] ─────────────────────────────────────────────── */
-
 __device__ __forceinline__ uint64_t rotl64(uint64_t x, int n) {
     return (x << n) | (x >> (64 - n));
 }
-
-/* Device constants (per-GPU constant memory) */
-__constant__ uint64_t d_RC[24];
-__constant__ int d_RHO[25];
-__constant__ int d_PI[25];
 
 __device__ __noinline__ void keccak_f1600_dev(uint64_t s[25]) {
     uint64_t C[5], D[5], tmp[25];
@@ -173,39 +170,41 @@ __global__ void mine_kernel(
     if (idx >= batch_size || *result_flag) return;
 
     uint64_t nonce = start_nonce + idx;
-
     uint64_t s[25];
+
     #pragma unroll
     for (int i = 0; i < 25; i++) s[i] = pre_state[i];
     s[7] = bswap64(nonce);
 
     keccak_f1600_dev(s);
 
+    /* Compare hash < difficulty (big-endian 256-bit) — no goto, use if-chain */
     uint64_t h0 = bswap64(s[0]);
-    if (h0 > diff_be[0]) return;
-    if (h0 < diff_be[0]) goto found;
-
     uint64_t h1 = bswap64(s[1]);
-    if (h1 > diff_be[1]) return;
-    if (h1 < diff_be[1]) goto found;
-
     uint64_t h2 = bswap64(s[2]);
-    if (h2 > diff_be[2]) return;
-    if (h2 < diff_be[2]) goto found;
-
     uint64_t h3 = bswap64(s[3]);
-    if (h3 >= diff_be[3]) return;
 
-found:
-    atomicExch((unsigned long long*)result_nonce, (unsigned long long)nonce);
-    atomicExch((int*)result_flag, 1);
+    int is_less = 0;
+    if (h0 < diff_be[0]) is_less = 1;
+    else if (h0 > diff_be[0]) return;
+    else if (h1 < diff_be[1]) is_less = 1;
+    else if (h1 > diff_be[1]) return;
+    else if (h2 < diff_be[2]) is_less = 1;
+    else if (h2 > diff_be[2]) return;
+    else if (h3 < diff_be[3]) is_less = 1;
+    else return; /* h3 >= diff_be[3] */
+
+    if (is_less) {
+        atomicExch((unsigned long long*)result_nonce, (unsigned long long)nonce);
+        atomicExch((int*)result_flag, 1);
+    }
 }
 
-/* ── Per-GPU thread context ────────────────────────────────────────────── */
+/* ── Per-GPU context ───────────────────────────────────────────────────── */
 
 struct GpuContext {
     int device_id;
-    cudaDeviceProp prop;
+    int sm_count;
     uint64_t* d_pre;
     uint64_t* d_diff;
     uint64_t* d_nonce;
@@ -218,7 +217,6 @@ struct GpuContext {
 struct GpuResult {
     int gpu_id;
     uint64_t nonce;
-    char hash[65];
     int found;
     uint64_t total_checked;
 };
@@ -229,7 +227,7 @@ struct ThreadArg {
     GpuContext* ctx;
     uint64_t pre_state[25];
     uint64_t diff_be[4];
-    uint64_t start_nonce;  /* unique per GPU */
+    uint64_t start_nonce;
     volatile int* global_stop;
     GpuResult* result;
 };
@@ -244,12 +242,12 @@ void* gpu_thread(void* arg) {
 
     cudaSetDevice(ctx->device_id);
 
-    /* Copy constants to this GPU's constant memory */
+    /* Copy constants */
     cudaMemcpyToSymbol(d_RC, h_RC, 24 * 8);
     cudaMemcpyToSymbol(d_RHO, h_RHO, 25 * 4);
     cudaMemcpyToSymbol(d_PI, h_PI, 25 * 4);
 
-    /* Copy pre_state and diff to device */
+    /* Copy state to device */
     cudaMemcpy(ctx->d_pre, ta->pre_state, 25 * 8, cudaMemcpyHostToDevice);
     cudaMemcpy(ctx->d_diff, ta->diff_be, 4 * 8, cudaMemcpyHostToDevice);
 
@@ -305,22 +303,9 @@ void* gpu_thread(void* arg) {
         if (found) {
             uint64_t result;
             cudaMemcpy(&result, ctx->d_nonce, 8, cudaMemcpyDeviceToHost);
-
-            /* Verify */
-            uint8_t msg[64];
-            memcpy(msg, ta->pre_state, 8 * 8);
-            memset(msg + 32, 0, 24);
-            for (int i = 0; i < 8; i++)
-                msg[63 - i] = (result >> (i * 8)) & 0xFF;
-
-            /* Re-compute pre_state lanes from challenge for verification */
-            /* The pre_state already has challenge absorbed, but msg needs raw challenge */
-            /* We'll just set res->nonce and let main handle verification */
-
             res->nonce = result;
             res->found = 1;
             res->total_checked = total_checked;
-
             *(ta->global_stop) = 1;
             break;
         }
@@ -335,10 +320,9 @@ void* gpu_thread(void* arg) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
-            "Usage: %s <challenge_hex_64chars> <difficulty_hex_64chars> [start_nonce]\n\n"
-            "Multi-GPU keccak-256 nonce finder for HASH256 mining.\n"
-            "Supports: 1x or 2x RTX 4090, H100, A100, etc.\n\n"
-            "Build: nvcc -O3 -arch=sm_89 --use_fast_math -o gpu-miner gpu-miner.cu -lcudart\n",
+            "Usage: %s <challenge_hex> <difficulty_hex> [start_nonce]\n\n"
+            "Multi-GPU keccak-256 nonce finder for HASH256.\n"
+            "Supports: RTX 5090 (Blackwell), RTX 4090, H100, A100, etc.\n\n",
             argv[0]);
         return 1;
     }
@@ -388,7 +372,6 @@ int main(int argc, char** argv) {
     fprintf(stderr, "║  Devices: %-4d                                              ║\n", dev_count);
     fprintf(stderr, "╚═══════════════════════════════════════════════════════════════╝\n\n");
 
-    /* Setup per-GPU contexts */
     GpuContext* gpus = (GpuContext*)malloc(dev_count * sizeof(GpuContext));
     GpuResult* results = (GpuResult*)malloc(dev_count * sizeof(GpuResult));
     ThreadArg* targs = (ThreadArg*)malloc(dev_count * sizeof(ThreadArg));
@@ -396,32 +379,42 @@ int main(int argc, char** argv) {
     for (int d = 0; d < dev_count; d++) {
         GpuContext* g = &gpus[d];
         g->device_id = d;
-        cudaGetDeviceProperties(&g->prop, d);
 
-        fprintf(stderr, "[gpu%d] %s (SM %d.%d, %d SMs, %.0f MHz, %zu MB, L2 %d KB)\n",
-                d, g->prop.name, g->prop.major, g->prop.minor,
-                g->prop.multiProcessorCount, g->prop.clockRate / 1000.0,
-                g->prop.totalGlobalMem / 1048576UL,
-                g->prop.l2CacheSize / 1024);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, d);
+        g->sm_count = prop.multiProcessorCount;
 
-        /* Tune batch per GPU class */
+        /* clockRate deprecated in newer CUDA — use 2000 MHz as default estimate */
+        int clock_mhz = 2000;
+        #ifdef CUDART_VERSION
+        #if CUDART_VERSION < 12040
+        clock_mhz = prop.clockRate / 1000;
+        #endif
+        #endif
+
+        fprintf(stderr, "[gpu%d] %s (SM %d.%d, %d SMs, ~%d MHz, %zu MB)\n",
+                d, prop.name, prop.major, prop.minor,
+                prop.multiProcessorCount, clock_mhz,
+                prop.totalGlobalMem / 1048576UL);
+
+        /* Tune batch per GPU */
         int blocks_per_sm = 512;
         g->threads = 512;
 
-        if (g->prop.multiProcessorCount <= 84) { blocks_per_sm = 256; }  /* A100 */
-        if (g->prop.multiProcessorCount <= 48) { blocks_per_sm = 256; }  /* smaller */
-        if (g->prop.multiProcessorCount <= 30) { blocks_per_sm = 128; }
+        if (prop.multiProcessorCount >= 100) { blocks_per_sm = 512; }  /* H100/RTX5090 */
+        else if (prop.multiProcessorCount >= 80) { blocks_per_sm = 256; }  /* A100/RTX4090 */
+        else if (prop.multiProcessorCount >= 40) { blocks_per_sm = 128; }  /* smaller */
+        else { blocks_per_sm = 64; }
 
-        g->grid_size = (uint64_t)g->prop.multiProcessorCount * blocks_per_sm;
+        g->grid_size = (uint64_t)prop.multiProcessorCount * blocks_per_sm;
         g->batch_size = g->grid_size * g->threads;
         if (g->batch_size > 134217728ULL) g->batch_size = 134217728ULL;
         g->grid_size = (g->batch_size + g->threads - 1) / g->threads;
 
-        fprintf(stderr, "[gpu%d] Grid: %llu × %d threads = %llu nonces/batch (%.1f M)\n\n",
+        fprintf(stderr, "[gpu%d] Grid: %llu × %d = %llu nonces/batch (%.1f M)\n\n",
                 d, (unsigned long long)g->grid_size, g->threads,
                 (unsigned long long)g->batch_size, g->batch_size / 1e6);
 
-        /* Allocate device memory */
         cudaSetDevice(d);
         cudaMalloc(&g->d_pre, 25 * 8);
         cudaMalloc(&g->d_diff, 4 * 8);
@@ -429,11 +422,11 @@ int main(int argc, char** argv) {
         cudaMalloc(&g->d_flag, 4);
     }
 
-    /* Launch per-GPU threads */
+    /* Launch threads */
     volatile int global_stop = 0;
     pthread_t* threads = (pthread_t*)malloc(dev_count * sizeof(pthread_t));
 
-    fprintf(stderr, "[miner] Starting %d GPU threads. Ctrl+C to stop.\n\n", dev_count);
+    fprintf(stderr, "[miner] Starting %d GPU thread(s). Ctrl+C to stop.\n\n", dev_count);
 
     for (int d = 0; d < dev_count; d++) {
         targs[d].ctx = &gpus[d];
@@ -448,19 +441,18 @@ int main(int argc, char** argv) {
         pthread_create(&threads[d], NULL, gpu_thread, &targs[d]);
     }
 
-    /* Wait for all threads */
-    for (int d = 0; d < dev_count; d++) {
+    for (int d = 0; d < dev_count; d++)
         pthread_join(threads[d], NULL);
-    }
 
     /* Check results */
     for (int d = 0; d < dev_count; d++) {
         if (results[d].found) {
-            /* Verify hash on host */
+            uint64_t nonce = results[d].nonce;
+
+            /* Verify */
             uint8_t msg[64];
             memcpy(msg, challenge, 32);
             memset(msg + 32, 0, 24);
-            uint64_t nonce = results[d].nonce;
             for (int i = 0; i < 8; i++)
                 msg[63 - i] = (nonce >> (i * 8)) & 0xFF;
             uint8_t hash[32];
@@ -478,14 +470,12 @@ int main(int argc, char** argv) {
                    (unsigned long long)nonce, hash_hex);
             fflush(stdout);
 
-            /* Cleanup */
             for (int dd = 0; dd < dev_count; dd++) {
                 cudaSetDevice(dd);
                 cudaFree(gpus[dd].d_pre);
                 cudaFree(gpus[dd].d_diff);
                 cudaFree(gpus[dd].d_nonce);
                 cudaFree(gpus[dd].d_flag);
-                cudaDeviceReset();
             }
             free(gpus); free(results); free(targs); free(threads);
             return 0;
@@ -502,7 +492,6 @@ int main(int argc, char** argv) {
         cudaFree(gpus[d].d_diff);
         cudaFree(gpus[d].d_nonce);
         cudaFree(gpus[d].d_flag);
-        cudaDeviceReset();
     }
     free(gpus); free(results); free(targs); free(threads);
     return 1;

@@ -9,7 +9,6 @@ echo "║  HASH256 Multi-GPU Miner — Build Script                     ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
-# Check nvcc
 if ! command -v nvcc &>/dev/null; then
     echo "❌ nvcc not found!"
     echo ""
@@ -25,16 +24,19 @@ fi
 NVCC_VER=$(nvcc --version | grep release | awk '{print $6}' | cut -c2-)
 echo "✅ nvcc: CUDA $NVCC_VER"
 
-# Get supported architectures
-echo "📋 Supported archs:"
-nvcc --list-gpu-arch 2>/dev/null | head -20 || true
+# Build list of supported SM archs from nvcc
+SUPPORTED=""
+while IFS= read -r line; do
+    arch=$(echo "$line" | sed 's/compute_/sm_/')
+    SUPPORTED="$SUPPORTED $arch"
+done < <(nvcc --list-gpu-arch 2>/dev/null | grep compute_ || true)
+echo "📋 Supported: $(echo $SUPPORTED | tr ' ' '\n' | sort -u | tr '\n' ' ')"
 echo ""
 
 # Default
-ARCH="sm_89"
+ARCH="sm_90"
 GPU_COUNT=0
 
-# Detect GPUs
 if command -v nvidia-smi &>/dev/null; then
     GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader | head -1 | xargs)
     echo "🎮 GPU Count: $GPU_COUNT"
@@ -48,83 +50,56 @@ if command -v nvidia-smi &>/dev/null; then
     done
     echo ""
 
-    # Use first GPU for arch detection
-    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)
+    # Get first GPU compute capability
     GPU_CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | xargs)
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)
     GPU_LOWER=$(echo "$GPU_NAME" | tr '[:upper:]' '[:lower:]')
 
-    # Map compute capability to arch flag
-    # First try by compute capability (most reliable)
-    case "$GPU_CC" in
-        10.0|10.1|10.2|10.3)
-            ARCH="sm_100"
-            echo "   → Architecture: sm_100 (Blackwell) 🔥🔥🔥"
-            ;;
-        9.0|9.1|9.2|9.3)
-            ARCH="sm_90"
-            echo "   → Architecture: sm_90 (Hopper)"
-            ;;
-        8.9)
-            ARCH="sm_89"
-            echo "   → Architecture: sm_89 (Ada Lovelace)"
-            ;;
-        8.6)
-            ARCH="sm_86"
-            echo "   → Architecture: sm_86 (Ampere)"
-            ;;
-        8.0)
-            ARCH="sm_80"
-            echo "   → Architecture: sm_80 (Ampere)"
-            ;;
-        7.5)
-            ARCH="sm_75"
-            echo "   → Architecture: sm_75 (Turing)"
-            ;;
-        7.0)
-            ARCH="sm_70"
-            echo "   → Architecture: sm_70 (Volta)"
-            ;;
-        6.1)
-            ARCH="sm_61"
-            echo "   → Architecture: sm_61 (Pascal)"
-            ;;
-        *)
-            # Fallback: detect by name
-            echo "   → Unknown compute cap $GPU_CC, trying name detection..."
+    # Convert compute capability to SM arch
+    # CC "12.0" → "sm_120", CC "8.9" → "sm_89", etc.
+    CC_MAJOR=$(echo "$GPU_CC" | cut -d. -f1)
+    CC_MINOR=$(echo "$GPU_CC" | cut -d. -f2)
+    CANDIDATE="sm_${CC_MAJOR}${CC_MINOR}"
+
+    # Check if this arch is supported by nvcc
+    if echo "$SUPPORTED" | grep -q "$CANDIDATE"; then
+        ARCH="$CANDIDATE"
+        echo "   → Architecture: $ARCH (compute $GPU_CC)"
+    else
+        # Try dropping minor version (e.g., sm_120 → sm_120, but sm_100 if sm_100 exists)
+        CANDIDATE_MAJOR="sm_${CC_MAJOR}0"
+        if echo "$SUPPORTED" | grep -q "$CANDIDATE_MAJOR"; then
+            ARCH="$CANDIDATE_MAJOR"
+            echo "   → Architecture: $ARCH (compute $GPU_CC, fallback to major)"
+        else
+            # Fallback to name-based
+            echo "   → CC $GPU_CC ($CANDIDATE) not in nvcc supported list"
             if echo "$GPU_LOWER" | grep -q "5090\|5080\|5070\|5060\|b100\|b200"; then
                 ARCH="sm_100"
-                echo "   → Architecture: sm_100 (Blackwell)"
             elif echo "$GPU_LOWER" | grep -q "h100\|h200"; then
                 ARCH="sm_90"
-                echo "   → Architecture: sm_90 (Hopper)"
             elif echo "$GPU_LOWER" | grep -q "4090\|4080\|4070\|4060\|l40"; then
                 ARCH="sm_89"
-                echo "   → Architecture: sm_89 (Ada Lovelace)"
             elif echo "$GPU_LOWER" | grep -q "a100"; then
                 ARCH="sm_80"
-                echo "   → Architecture: sm_80 (Ampere)"
             elif echo "$GPU_LOWER" | grep -q "3090\|3080\|3070\|3060\|a5000\|a6000"; then
                 ARCH="sm_86"
-                echo "   → Architecture: sm_86 (Ampere)"
-            else
-                echo "   → Default: $ARCH"
             fi
-            ;;
-    esac
+
+            # Final check
+            if ! echo "$SUPPORTED" | grep -q "$ARCH"; then
+                echo "   → $ARCH not supported, falling back to sm_90"
+                ARCH="sm_90"
+            fi
+            echo "   → Architecture: $ARCH (name-based fallback)"
+        fi
+    fi
 
     if [ "$GPU_COUNT" -gt 1 ]; then
         echo "   → Multi-GPU mode: $GPU_COUNT GPUs 🔥"
     fi
 else
     echo "⚠️  nvidia-smi not found, default: $ARCH"
-fi
-
-# Check if arch is supported by nvcc
-if ! nvcc --list-gpu-arch 2>/dev/null | grep -q "$ARCH"; then
-    echo ""
-    echo "⚠️  $ARCH not supported by nvcc $NVCC_VER"
-    echo "   Falling back to sm_90"
-    ARCH="sm_90"
 fi
 
 echo ""
@@ -144,9 +119,9 @@ nvcc -O3 \
 echo ""
 echo "✅ Build successful!"
 echo ""
-echo "📦 Binary: ./gpu-miner ($(du -h gpu-miner | cut -f1))"
-echo "🎮 GPUs:   $GPU_COUNT"
-echo "🏗  Arch:    $ARCH"
+echo "📦 Binary:  ./gpu-miner ($(du -h gpu-miner | cut -f1))"
+echo "🎮 GPUs:    $GPU_COUNT"
+echo "🏗  Arch:     $ARCH"
 echo ""
 echo "🚀 Run:  npm run gpu"
 echo ""
