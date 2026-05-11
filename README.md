@@ -2,20 +2,22 @@
 
 CLI miner for **$HASH** — a browser-mined post-quantum token on Ethereum mainnet. Source: [hash256.org](https://hash256.org)
 
-Script ini mengambil challenge dari smart contract, mencari nonce yang memenuhi difficulty target, lalu submit transaksi `mine(nonce)` ke Ethereum mainnet.
+Script ini mengambil challenge dari smart contract, mencari nonce yang memenuhi difficulty target (multi-threaded!), lalu submit transaksi `mine(nonce)` ke Ethereum mainnet.
 
-> **v2.0** — major improvements: colored output, real-time hashrate stats, gas management, graceful shutdown, wallet balance display, supply progress bar.
+> **v2.1** — Multi-threaded mining via `worker_threads`! Maxes out all CPU cores. Plus colored output, real-time hashrate stats, gas management, graceful shutdown.
 
 ## ✨ Features
 
+- 🧵 **Multi-threaded mining** — uses all CPU cores via `worker_threads`
 - 🎨 **Colored terminal output** with timestamps and formatted stats
 - ⛏  **Real-time hashrate tracking** with rolling average
 - ⛽ **Gas management** — skip TX if gas too high, auto-wait for drop
-- 📊 **Live stats** — hashes, found, TX success/fail, uptime
+- 📊 **Live stats** — hashes, found, TX success/fail, uptime, CPU load
 - 🔄 **Auto re-challenge** — detects epoch changes and fetches fresh challenge
 - 🪙 **Wallet balance display** — ETH and HASH balance on start
 - 📈 **Supply progress bar** in check-state
 - 🛑 **Graceful shutdown** — Ctrl+C shows final stats
+- 🖥 **CPU info display** — shows CPU model, cores, RAM on start
 
 ## ⚠️ Peringatan
 
@@ -53,7 +55,7 @@ brew install node
 ### 2. Setup Project
 
 ```bash
-git clone https://github.com/mrfunntastiic/hash256-cli
+git clone https://github.com/ulsreall/hash256-cli
 cd hash256-cli
 npm install
 cp .env.example .env
@@ -67,11 +69,13 @@ RPC_URL=https://ethereum-rpc.publicnode.com
 PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE
 ```
 
-**Optional config:**
+**Optional tuning:**
 ```env
-MAX_GAS_GWEI=50        # Skip TX if gas > this (default: 50)
-GAS_LIMIT=300000        # TX gas limit (default: 300000)
-RETRY_DELAY=5000        # Delay on error in ms (default: 5000)
+THREADS=4              # Worker threads (default: CPU count - 1)
+BATCH_SIZE=100000      # Hashes per worker progress report
+MAX_GAS_GWEI=50        # Skip TX if gas > this
+GAS_LIMIT=300000       # TX gas limit
+RETRY_DELAY=5000       # Delay on error in ms
 ```
 
 Simpan di nano: `CTRL + X` → `Y` → `Enter`
@@ -84,29 +88,27 @@ npm run check
 
 Output:
 ```
-────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────
   🌍 GENESIS STATE
-────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────
   Total Sold:      1,050,000 HASH
   Total Raised:    10.5 ETH
-  Max Supply:      1,050,000 HASH
   Complete:        ✓ Yes
 
-────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────
   ⛏  MINING STATE
-────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────
   Era:              Era 1
   Reward:           100 HASH per mint
   Total Minted:     12,345
   Remaining:        18,887,655
-  Epoch:            1
 
   Supply Progress:
   [█░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 0.07%
 
-────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────
   🔑 WALLET
-────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────
   Address:     0x...
   ETH Balance:  0.1 ETH
   HASH Balance: 200 HASH
@@ -118,11 +120,6 @@ Output:
 npm start
 ```
 
-Atau langsung:
-```bash
-node miner.js
-```
-
 Contoh output:
 
 ```
@@ -132,18 +129,32 @@ Contoh output:
   ██╔══██║██╔══██║╚════██║██╔══██║
   ██║  ██║██║  ██║███████║██║  ██║
   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
-  CLI Miner v2.0 · Ethereum Mainnet · hash256.org
+  CLI Miner v2.1 · Ethereum Mainnet · hash256.org
+  4 CPUs · Intel Xeon · 2.0 GB RAM
+
+┌─ Configuration ──────────────────────────────────────────────┐
+│  🔑 Wallet    0x...
+│  📄 Contract  0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc
+│  🧵 Threads   3 / 4 CPUs
+│  ⛽ Max Gas    50 gwei
+│  📦 Gas Limit  300,000
+│  🔄 Batch/Thread 100,000
+└──────────────────────────────────────────────────────────────┘
 
 [10:30:45] 💰 ETH Balance: 0.100000 ETH
 [10:30:45] 🪙 HASH Balance: 0 HASH
 [10:30:46] ⛽ Current Gas: 12.3 gwei
-[10:30:46] ⛏  Mining started! Press Ctrl+C to stop.
+[10:30:46] ⛏  Mining started with 3 threads! Ctrl+C to stop.
 
-[10:31:00] 🔄 New epoch · fetching fresh challenge
+[10:31:00] 🔄 New epoch · fresh challenge loaded
   Era: 1  │  Reward: 100 HASH  │  Epoch: 1
+  Minted: 12,345  │  Remaining: 18,887,655
 
-  ⛏  Hashrate  1,234 H/s    │  Hashes  615,000         │  Uptime  5m 30s
+──────────────────────────────────────────────────────────────
+  ⛏  Hashrate  5.23 KH/s     │  Hashes  3,140,000        │  Uptime  10m 0s
   🎯 Found  0                │  TX OK  0                │  TX Fail  0
+  🧵 Threads  3              │  CPU Load  2.85 / 2.90 / 2.70
+──────────────────────────────────────────────────────────────
 
 [10:35:12] 🎯 FOUND nonce: 8472915643
 [10:35:12]    Hash: 0x0000000a3f...
@@ -167,6 +178,18 @@ npm start
 # Detach: CTRL+A, D
 # Reattach: screen -r hash256
 ```
+
+## 🔧 Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RPC_URL` | (required) | Ethereum RPC endpoint |
+| `PRIVATE_KEY` | (required) | Wallet private key (0x...) |
+| `THREADS` | CPU count - 1 | Number of mining worker threads |
+| `BATCH_SIZE` | 100000 | Hashes per worker progress report |
+| `MAX_GAS_GWEI` | 50 | Max gas price to submit TX |
+| `GAS_LIMIT` | 300000 | TX gas limit |
+| `RETRY_DELAY` | 5000 | Delay (ms) on error before retry |
 
 ## 🔧 Error Umum
 

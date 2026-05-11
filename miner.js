@@ -1,14 +1,18 @@
 require("dotenv").config();
 
 const { ethers } = require("ethers");
+const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
+const os = require("os");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const RPC_URL = process.env.RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc";
+const NUM_THREADS = parseInt(process.env.THREADS || String(Math.max(1, os.cpus().length - 1)), 10);
 const MAX_GAS_GWEI = parseFloat(process.env.MAX_GAS_GWEI || "50");
 const GAS_LIMIT = parseInt(process.env.GAS_LIMIT || "300000", 10);
 const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || "5000", 10);
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100000", 10);
 
 const ABI = [
   "function getChallenge(address miner) view returns (bytes32)",
@@ -17,18 +21,51 @@ const ABI = [
   "function balanceOf(address) view returns (uint256)",
 ];
 
+// ═════════════════════════════════════════════════════════════════════════════
+// WORKER THREAD — each thread mines independently
+// ═════════════════════════════════════════════════════════════════════════════
+if (!isMainThread) {
+  const { solidityPackedKeccak256 } = ethers;
+  const { challengeHex, difficultyHex, batchSize, startNonce } = workerData;
+
+  const difficulty = BigInt(difficultyHex);
+  let nonce = BigInt(startNonce);
+
+  // Mining tight loop — pure CPU work, no async needed
+  for (let i = 0; ; i++) {
+    const hash = solidityPackedKeccak256(
+      ["bytes32", "uint256"],
+      [challengeHex, nonce]
+    );
+    const hashNum = BigInt(hash);
+
+    if (hashNum < difficulty) {
+      parentPort.postMessage({
+        found: true,
+        nonce: nonce.toString(),
+        hash,
+      });
+      process.exit(0);
+    }
+
+    nonce++;
+
+    // Report progress every batchSize hashes
+    if ((i + 1) % batchSize === 0) {
+      parentPort.postMessage({ found: false, count: batchSize });
+    }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MAIN THREAD
+// ═════════════════════════════════════════════════════════════════════════════
+
 // ─── Colors & Logging ─────────────────────────────────────────────────────────
 const C = {
-  reset: "\x1b[0m",
-  bold: "\x1b[1m",
-  dim: "\x1b[2m",
-  red: "\x1b[31m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  blue: "\x1b[34m",
-  magenta: "\x1b[35m",
-  cyan: "\x1b[36m",
-  white: "\x1b[37m",
+  reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
+  red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
+  blue: "\x1b[34m", magenta: "\x1b[35m", cyan: "\x1b[36m", white: "\x1b[37m",
 };
 
 const ts = () => new Date().toLocaleTimeString("en-GB", { hour12: false });
@@ -38,6 +75,9 @@ function log(emoji, color, msg) {
 }
 
 function banner() {
+  const cpuCount = os.cpus().length;
+  const cpuModel = os.cpus()[0]?.model || "Unknown";
+  const totalMem = (os.totalmem() / 1024 / 1024 / 1024).toFixed(1);
   console.log(`
 ${C.cyan}${C.bold}  ██╗  ██╗ █████╗ ███████╗██╗  ██╗  ${C.reset}
 ${C.cyan}${C.bold}  ██║  ██║██╔══██╗██╔════╝██║  ██║  ${C.reset}
@@ -45,11 +85,12 @@ ${C.cyan}${C.bold}  ███████║███████║████
 ${C.cyan}${C.bold}  ██╔══██║██╔══██║╚════██║██╔══██║  ${C.reset}
 ${C.cyan}${C.bold}  ██║  ██║██║  ██║███████║██║  ██║  ${C.reset}
 ${C.cyan}${C.bold}  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝  ${C.reset}
-${C.dim}  CLI Miner v2.0 · Ethereum Mainnet · hash256.org${C.reset}
+${C.dim}  CLI Miner v2.1 · Ethereum Mainnet · hash256.org${C.reset}
+${C.dim}  ${cpuCount} CPUs · ${cpuModel.trim().slice(0, 50)} · ${totalMem} GB RAM${C.reset}
 `);
 }
 
-// ─── Stats Tracker ────────────────────────────────────────────────────────────
+// ─── Stats ────────────────────────────────────────────────────────────────────
 const stats = {
   startTime: Date.now(),
   totalHashes: 0n,
@@ -61,9 +102,8 @@ const stats = {
 
 function recordHashes(count) {
   stats.totalHashes += BigInt(count);
-  stats._hashWindow.push({ count, time: Date.now() });
-  // keep last 20 samples
-  if (stats._hashWindow.length > 20) stats._hashWindow.shift();
+  stats._hashWindow.push({ count: BigInt(count), time: Date.now() });
+  if (stats._hashWindow.length > 50) stats._hashWindow.shift();
 }
 
 function getHashrate() {
@@ -71,9 +111,9 @@ function getHashrate() {
   if (w.length < 2) return 0;
   const first = w[0];
   const last = w[w.length - 1];
-  const totalHashes = Number(stats.totalHashes);
+  const totalH = Number(stats.totalHashes);
   const dt = (last.time - first.time) / 1000;
-  return dt > 0 ? totalHashes / dt : 0;
+  return dt > 0 ? totalH / dt : 0;
 }
 
 function formatDuration(ms) {
@@ -98,7 +138,8 @@ function printStats() {
   const uptime = formatDuration(Date.now() - stats.startTime);
   const hr = getHashrate();
   const hrStr = formatHashrate(hr);
-  const sep = `${C.dim}${"─".repeat(64)}${C.reset}`;
+  const load = os.loadavg();
+  const sep = `${C.dim}${"─".repeat(66)}${C.reset}`;
   console.log(sep);
   console.log(
     `  ${C.cyan}⛏  Hashrate${C.white} ${hrStr.padEnd(14)}${C.dim}│${C.reset} ` +
@@ -109,6 +150,10 @@ function printStats() {
     `  ${C.cyan}🎯 Found${C.green} ${String(stats.solutionsFound).padEnd(13)}${C.dim}│${C.reset} ` +
     `${C.cyan}TX OK${C.green} ${String(stats.txSuccess).padEnd(15)}${C.dim}│${C.reset} ` +
     `${C.cyan}TX Fail${C.red} ${stats.txFailed}`
+  );
+  console.log(
+    `  ${C.cyan}🧵 Threads${C.white} ${String(NUM_THREADS).padEnd(12)}${C.dim}│${C.reset} ` +
+    `${C.cyan}CPU Load${C.white} ${load[0].toFixed(2)} / ${load[1].toFixed(2)} / ${load[2].toFixed(2)}`
   );
   console.log(sep);
 }
@@ -148,30 +193,67 @@ async function waitForLowGas(provider, maxGwei) {
       log("⛽", C.green, `Gas now ${gasGwei.toFixed(1)} gwei ✓`);
       return true;
     }
-    if (i % 12 === 11) console.log(); // newline every ~60s
+    if (i % 12 === 11) console.log();
   }
   console.log();
   log("⛽", C.yellow, `Gas still high after 10min — submitting anyway`);
   return false;
 }
 
-// ─── Core Mining Function ─────────────────────────────────────────────────────
-function findNonce(challengeHex, difficulty, startNonce, batchSize) {
-  for (let i = 0; i < batchSize; i++) {
-    const testNonce = startNonce + BigInt(i);
-    const hash = ethers.solidityPackedKeccak256(
-      ["bytes32", "uint256"],
-      [challengeHex, testNonce]
-    );
-    const hashNum = BigInt(hash);
-    if (hashNum < difficulty) {
-      return { found: true, nonce: testNonce, hash };
+// ─── Multi-Thread Mining ──────────────────────────────────────────────────────
+function mineMultiThread(challengeHex, difficulty) {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const workers = [];
+
+    const stopAll = () => {
+      for (const w of workers) {
+        try { w.terminate(); } catch {}
+      }
+    };
+
+    for (let i = 0; i < NUM_THREADS; i++) {
+      // Each thread gets a different nonce range to avoid overlap
+      const startNonce = randomNonce() + BigInt(i) * 10_000_000_000n;
+
+      const worker = new Worker(__filename, {
+        workerData: {
+          challengeHex,
+          difficultyHex: difficulty.toString(),
+          batchSize: BATCH_SIZE,
+          startNonce: startNonce.toString(),
+        },
+      });
+
+      worker.on("message", (msg) => {
+        if (resolved) return;
+
+        if (msg.found) {
+          resolved = true;
+          stopAll();
+          resolve({ found: true, nonce: msg.nonce, hash: msg.hash });
+        } else {
+          // msg.count = hashes checked in this batch (delta, not cumulative)
+          recordHashes(msg.count);
+        }
+      });
+
+      worker.on("error", (err) => {
+        if (!resolved) log("✗", C.red, `Worker error: ${err.message}`);
+      });
+
+      worker.on("exit", (code) => {
+        if (!resolved && code !== 0) {
+          log("⚠", C.yellow, `Worker exited with code ${code}`);
+        }
+      });
+
+      workers.push(worker);
     }
-  }
-  return { found: false };
+  });
 }
 
-// ─── Mining Loop ──────────────────────────────────────────────────────────────
+// ─── Main Mining Loop ─────────────────────────────────────────────────────────
 async function main() {
   requireEnv();
   banner();
@@ -180,16 +262,18 @@ async function main() {
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
   const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 
-  // Display config
-  console.log(`${C.dim}┌─ Configuration ──────────────────────────────────────────┐${C.reset}`);
+  // Config display
+  console.log(`${C.dim}┌─ Configuration ──────────────────────────────────────────────┐${C.reset}`);
   console.log(`${C.dim}│${C.reset}  🔑 Wallet    ${C.white}${wallet.address}${C.reset}`);
   console.log(`${C.dim}│${C.reset}  📄 Contract  ${C.white}${CONTRACT_ADDRESS}${C.reset}`);
+  console.log(`${C.dim}│${C.reset}  🧵 Threads   ${C.white}${NUM_THREADS} / ${os.cpus().length} CPUs${C.reset}`);
   console.log(`${C.dim}│${C.reset}  ⛽ Max Gas    ${C.white}${MAX_GAS_GWEI} gwei${C.reset}`);
   console.log(`${C.dim}│${C.reset}  📦 Gas Limit  ${C.white}${GAS_LIMIT.toLocaleString()}${C.reset}`);
-  console.log(`${C.dim}└───────────────────────────────────────────────────────────┘${C.reset}`);
+  console.log(`${C.dim}│${C.reset}  🔄 Batch/Thread ${C.white}${BATCH_SIZE.toLocaleString()}${C.reset}`);
+  console.log(`${C.dim}└──────────────────────────────────────────────────────────────┘${C.reset}`);
   console.log();
 
-  // Pre-flight checks
+  // Pre-flight
   const balance = await provider.getBalance(wallet.address);
   const ethBal = parseFloat(ethers.formatEther(balance));
   log("💰", C.cyan, `ETH Balance: ${C.white}${ethBal.toFixed(6)} ETH`);
@@ -197,9 +281,7 @@ async function main() {
     log("✗", C.red, "Wallet has no ETH for gas! Fund it first.");
     process.exit(1);
   }
-  if (ethBal < 0.001) {
-    log("⚠", C.yellow, "Low ETH balance — may run out of gas soon");
-  }
+  if (ethBal < 0.001) log("⚠", C.yellow, "Low ETH — may run out of gas soon");
 
   try {
     const hashBal = await contract.balanceOf(wallet.address);
@@ -211,20 +293,18 @@ async function main() {
   const { gasGwei } = await checkGas(provider);
   log("⛽", C.cyan, `Current Gas:  ${C.white}${gasGwei.toFixed(1)} gwei`);
   console.log();
-  log("⛏ ", C.green + C.bold, "Mining started! Press Ctrl+C to stop.");
+  log("⛏ ", C.green + C.bold, `Mining started with ${NUM_THREADS} threads! Ctrl+C to stop.`);
   console.log();
 
   // Stats printer
   const statsInterval = setInterval(printStats, 30_000);
   setTimeout(printStats, 5_000);
 
-  // Main mining loop
+  // Main loop
   let lastEpoch = "";
-  const BATCH_SIZE = 50_000;
 
   while (true) {
     try {
-      // Fetch contract state
       const state = await contract.miningState();
       const difficulty = BigInt(state.difficulty.toString());
       const era = state.era.toString();
@@ -233,32 +313,25 @@ async function main() {
       const minted = state.minted.toString();
       const remaining = state.remaining.toString();
 
-      // Get challenge
       const challenge = await contract.getChallenge(wallet.address);
 
-      // Print round info if epoch changed
       if (epoch !== lastEpoch) {
         lastEpoch = epoch;
         console.log();
-        log("🔄", C.blue, "New epoch · fetching fresh challenge");
+        log("🔄", C.blue, "New epoch · fresh challenge loaded");
         console.log(
           `  ${C.dim}Era:${C.reset} ${C.white}${era}${C.reset}  ${C.dim}│${C.reset} ` +
           `${C.dim}Reward:${C.reset} ${C.green}${reward} HASH${C.reset}  ${C.dim}│${C.reset} ` +
           `${C.dim}Epoch:${C.reset} ${C.white}${epoch}${C.reset}`
         );
         console.log(
-          `  ${C.dim}Difficulty:${C.reset} ${C.white}${difficulty.toString().slice(0, 24)}...${C.reset}`
-        );
-        console.log(
-          `  ${C.dim}Minted:${C.reset} ${C.white}${minted}${C.reset}  ${C.dim}│${C.reset} ` +
-          `${C.dim}Remaining:${C.reset} ${C.white}${remaining}${C.reset}`
+          `  ${C.dim}Minted:${C.reset} ${C.white}${Number(minted).toLocaleString()}${C.reset}  ${C.dim}│${C.reset} ` +
+          `${C.dim}Remaining:${C.reset} ${C.white}${Number(remaining).toLocaleString()}${C.reset}`
         );
       }
 
-      // Generate random start nonce and search batch
-      let nonce = randomNonce();
-      let result = findNonce(challenge, difficulty, nonce, BATCH_SIZE);
-      recordHashes(BATCH_SIZE);
+      // Spawn workers
+      const result = await mineMultiThread(challenge, difficulty);
 
       if (result.found) {
         stats.solutionsFound++;
@@ -274,7 +347,7 @@ async function main() {
 
         // Submit TX
         try {
-          const tx = await contract.mine(result.nonce, { gasLimit: GAS_LIMIT });
+          const tx = await contract.mine(BigInt(result.nonce), { gasLimit: GAS_LIMIT });
           log("📤", C.blue, `TX sent: ${C.white}https://etherscan.io/tx/${tx.hash}`);
 
           const receipt = await tx.wait();
@@ -282,7 +355,6 @@ async function main() {
           log("✅", C.green + C.bold, `Confirmed in block ${C.white}${receipt.blockNumber}`);
           console.log();
 
-          // Update HASH balance
           try {
             const newBal = await contract.balanceOf(wallet.address);
             log("🪙", C.cyan, `HASH Balance: ${C.white}${ethers.formatUnits(newBal, 18)} HASH`);
@@ -291,21 +363,15 @@ async function main() {
         } catch (err) {
           stats.txFailed++;
           const msg = err.shortMessage || err.message || String(err);
-          if (msg.includes("InsufficientWork")) {
-            log("⏭", C.yellow, "InsufficientWork — nonce no longer valid, retrying...");
-          } else if (msg.includes("execution reverted")) {
-            log("⏭", C.yellow, "Already mined or state changed, retrying...");
+          if (msg.includes("InsufficientWork") || msg.includes("execution reverted")) {
+            log("⏭", C.yellow, "Nonce invalid or already mined — retrying...");
           } else {
             log("✗", C.red, `TX failed: ${msg}`);
           }
         }
 
-        // Brief pause before next round
         await sleep(1000);
       }
-
-      // Yield to event loop
-      await sleep(10);
 
     } catch (err) {
       const msg = err.shortMessage || err.message || String(err);
