@@ -1,44 +1,68 @@
-# HASH256 CLI Miner
+# HASH256 Miner
 
 GPU + CPU CLI miner for **$HASH** — a browser-mined post-quantum token on Ethereum mainnet. Source: [hash256.org](https://hash256.org)
 
 ## ⚡ Modes
 
-| Mode | Command | Speed | Requirement |
-|------|---------|-------|-------------|
-| **GPU** | `npm run gpu` | ~500+ MH/s | NVIDIA GPU + CUDA |
-| **CPU** | `npm start` | ~5-10 KH/s | Node.js 18+ |
+| Mode | Command | Est. Speed | Requirement |
+|------|---------|------------|-------------|
+| **GPU** | `npm run gpu` | **10+ GH/s** (H100) | NVIDIA GPU + CUDA |
+| **CPU** | `npm start` | ~10-30 KH/s (48 cores) | Node.js 18+ |
 
 ## ✨ Features
 
-### GPU Miner (CUDA)
-- ⚡ **CUDA keccak-256** — runs PoW directly on GPU, ~100x faster than CPU
-- 🎮 **Auto GPU detection** — picks best GPU, auto-selects architecture
-- 📊 **Real-time hashrate** displayed in stderr
-- 🔄 **Smart retry** — epoch changes, gas management
+- ⚡ **CUDA keccak-256** — PoW langsung di GPU, ~1000x lebih cepat dari browser
+- 🧵 **Multi-threaded CPU** — uses semua core via `worker_threads`
+- 🎮 **Auto GPU detect** — picks GPU terbaik, auto arch (Pascal → Hopper)
+- 🎨 **Colored terminal** — timestamps, formatted stats
+- ⛽ **Gas management** — auto-wait kalau gas terlalu tinggi
+- 🪙 **Wallet balance** — ETH + HASH tampil di awal
+- 🛑 **Graceful shutdown** — Ctrl+C tampilin final stats
+- 📊 **Supply progress bar** — visual mining progress
 
-### CPU Miner (Node.js)
-- 🧵 **Multi-threaded** — uses all CPU cores via `worker_threads`
-- ⛏  **Real-time hashrate** with rolling average
-- 📊 **CPU load display** in stats
+## 🚀 Quick Start (One Command!)
 
-### Both Modes
-- 🎨 **Colored terminal output** with timestamps
-- ⛽ **Gas management** — auto-wait if gas too high
-- 🪙 **Wallet balance display** — ETH and HASH on start
-- 🛑 **Graceful shutdown** — Ctrl+C shows final stats
-- 🔄 **Auto re-challenge** — detects epoch changes
+```bash
+git clone https://github.com/ulsreall/hash256-cli
+cd hash256-cli
+bash setup.sh
+```
 
-## ⚠️ Peringatan
+Setup script otomatis:
+1. ✅ Install Node.js (kalau belum ada)
+2. ✅ Install CUDA toolkit (kalau GPU ada)
+3. ✅ npm install
+4. ✅ Build GPU miner (auto-detect arch)
+5. ✅ Create .env dari template
 
-- Mining memakai **Ethereum mainnet** — butuh ETH untuk gas
-- **Jangan pakai private key wallet utama** — buat wallet khusus mining
-- **Jangan commit file `.env`**
-- Verifikasi kontrak: [Etherscan](https://etherscan.io/address/0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc)
+Setelah setup selesai:
+```bash
+nano .env          # Isi PRIVATE_KEY
+tmux new -s hash   # Buat session
+npm run gpu        # Jalankan!
+```
 
-## 🚀 Quick Start
+## 📖 Manual Install
 
-### 1. Install
+### 1. Install Dependencies
+
+**Node.js:**
+```bash
+# Ubuntu/Debian
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
+sudo apt install -y nodejs
+```
+
+**CUDA Toolkit (kalau punya GPU):**
+```bash
+# Ubuntu 22.04
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install -y cuda-toolkit-12-4
+```
+
+### 2. Clone & Install
 
 ```bash
 git clone https://github.com/ulsreall/hash256-cli
@@ -46,86 +70,76 @@ cd hash256-cli
 npm install
 ```
 
-### 2. Configure
+### 3. Configure
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Isi minimal:
 ```env
 RPC_URL=https://ethereum-rpc.publicnode.com
-PRIVATE_KEY=0xYOUR_PRIVATE_KEY
+PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE
 ```
 
-### 3. Run
+### 4. Build GPU Miner
 
-**GPU Mining** (NVIDIA GPU required):
 ```bash
-# Build CUDA binary first
 bash build.sh
+```
 
-# Run
+Auto-detect GPU architecture:
+| GPU Series | Arch Flag | Example GPUs |
+|-----------|-----------|-------------|
+| Pascal | sm_61 | GTX 1060/1070/1080 |
+| Volta | sm_70 | V100 |
+| Turing | sm_75 | RTX 2060/2070/2080 |
+| Ampere | sm_80 | A100 |
+| Ampere | sm_86 | RTX 3060/3070/3080/3090, A5000 |
+| Ada Lovelace | sm_89 | RTX 4060/4070/4080/4090, L40 |
+| **Hopper** | **sm_90** | **H100, H200** 🚀 |
+
+### 5. Run
+
+```bash
+# GPU Mining (cepat!)
 npm run gpu
-```
 
-**CPU Mining** (any machine):
-```bash
+# CPU Mining
 npm start
-```
 
-**Check contract state:**
-```bash
+# Check state
 npm run check
 ```
-
-## 🛠 Build GPU Miner
-
-### Prerequisites
-- NVIDIA GPU (RTX 20xx / 30xx / 40xx recommended)
-- CUDA Toolkit 12+
-
-### Install CUDA (Ubuntu)
-```bash
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-sudo apt install -y cuda-toolkit-12-4
-```
-
-### Build
-```bash
-bash build.sh
-```
-
-Auto-detects GPU architecture (sm_75 for RTX 20xx, sm_86 for RTX 30xx, etc).
-
-### Supported Architectures
-| GPU | Architecture | Flag |
-|-----|-------------|------|
-| GTX 10xx | Pascal | sm_61 |
-| RTX 20xx | Turing | sm_75 |
-| RTX 30xx / A5000 | Ampere | sm_86 |
-| RTX 40xx | Ada Lovelace | sm_89 |
-| V100 | Volta | sm_70 |
-| A100 | Ampere | sm_80 |
 
 ## 🖥 Run di Background
 
 ```bash
-# tmux
+# tmux (recommended)
 tmux new -s hash256
-npm run gpu    # atau npm start
-# Detach: CTRL+B, D
+npm run gpu
+# Detach: CTRL+B → D
 # Reattach: tmux attach -t hash256
 
 # screen
 screen -S hash256
 npm run gpu
-# Detach: CTRL+A, D
+# Detach: CTRL+A → D
 # Reattach: screen -r hash256
 ```
+
+## ⚡ Expected Performance
+
+| Hardware | Mode | Est. Hashrate | Era 1 (100 HASH) |
+|----------|------|---------------|-------------------|
+| **H100 80GB** | GPU | **10+ GH/s** | ~seconds |
+| **A100 80GB** | GPU | ~5 GH/s | ~seconds |
+| **RTX 4090** | GPU | ~2-3 GH/s | ~10-30 detik |
+| **RTX 3090** | GPU | ~800 MH/s | ~30-60 detik |
+| **RTX 3070** | GPU | ~400 MH/s | ~1-2 menit |
+| 48-core EPYC | CPU | ~20-30 KH/s | ~1-2 jam |
+| 16-core Xeon | CPU | ~5-6 KH/s | ~3-6 jam |
+| 8-core | CPU | ~3-4 KH/s | ~6-12 jam |
 
 ## 🔧 Environment Variables
 
@@ -133,35 +147,51 @@ npm run gpu
 |----------|---------|-------------|
 | `RPC_URL` | (required) | Ethereum RPC endpoint |
 | `PRIVATE_KEY` | (required) | Wallet private key (0x...) |
-| `THREADS` | CPU count - 1 | Worker threads (CPU miner only) |
-| `BATCH_SIZE` | 100000 | Hashes per worker report (CPU miner) |
+| `THREADS` | CPU-1 | Worker threads (CPU miner) |
+| `BATCH_SIZE` | 100000 | Hashes per worker report |
 | `MAX_GAS_GWEI` | 50 | Max gas price to submit TX |
 | `GAS_LIMIT` | 300000 | TX gas limit |
 | `RETRY_DELAY` | 5000 | Delay (ms) on error |
 
-## 🔧 Error Umum
+## 📁 File Structure
 
-| Error | Penyebab | Solusi |
-|-------|----------|--------|
-| `gpu-miner not found` | Belum build | `bash build.sh` |
-| `No CUDA devices` | Gak ada GPU | Pakai `npm start` (CPU) |
-| `Missing RPC_URL` | `.env` kosong | `cp .env.example .env` |
-| `insufficient funds` | ETH habis | Kirim ETH ke wallet |
+```
+hash256-cli/
+├── miner.js          # CPU miner (multi-threaded)
+├── gpu-miner.cu      # CUDA kernel (keccak-256 PoW)
+├── gpu-miner.js      # GPU miner wrapper (Node.js)
+├── check-state.js    # Contract state checker
+├── build.sh          # Build CUDA binary
+├── setup.sh          # One-click VPS setup
+├── .env.example      # Config template
+├── package.json
+└── README.md
+```
+
+## 🔧 Troubleshooting
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `gpu-miner not found` | Not built | `bash build.sh` |
+| `No CUDA devices` | No GPU | Use `npm start` |
+| `nvcc not found` | No CUDA toolkit | Install CUDA toolkit |
+| `Missing RPC_URL` | .env empty | `cp .env.example .env` |
+| `insufficient funds` | No ETH | Send ETH to wallet |
 | `InsufficientWork` | Nonce expired | Auto-retry |
-| `nvcc not found` | CUDA belum install | Install CUDA toolkit |
+| `Gas too high` | Gas spike | Auto-wait or lower limit |
 
 ## 📐 Tokenomics
 
 | | |
 |---|---|
-| **Token** | $HASH |
-| **Supply** | 21,000,000 |
-| **Genesis (5%)** | 1,050,000 @ $0.03 |
-| **Mining (90%)** | 18,900,000 (PoW) |
-| **LP (5%)** | 1,050,000 (hook mints) |
-| **Team/VC** | 0% — fair launch |
+| Token | $HASH |
+| Supply | 21,000,000 |
+| Genesis (5%) | 1,050,000 @ $0.03 |
+| Mining (90%) | 18,900,000 (PoW) |
+| LP (5%) | 1,050,000 |
+| Team/VC | 0% — fair launch |
 
-**Emission (halving setiap 100k mints):**
+**Emission** (halving setiap 100k mints):
 - Era 1: 100 HASH/mint (~69 days)
 - Era 2: 50 HASH/mint
 - Era 3: 25 HASH/mint

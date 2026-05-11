@@ -1,28 +1,20 @@
 {
-  "name": "hash256-cli",
+  "name": "hash256-miner",
   "version": "3.0.0",
-  "description": "GPU + CPU CLI miner for HASH256 ($HASH) — post-quantum token on Ethereum mainnet.",
+  "description": "GPU + CPU CLI miner for HASH256 ($HASH) — post-quantum PoW on Ethereum mainnet. Optimized for H100/A100/RTX GPUs.",
   "main": "miner.js",
   "scripts": {
     "start": "node miner.js",
     "gpu": "node gpu-miner.js",
     "check": "node check-state.js",
-    "build": "bash build.sh"
+    "build": "bash build.sh",
+    "setup": "bash setup.sh"
   },
   "keywords": [
-    "hash256",
-    "ethereum",
-    "miner",
-    "cli",
-    "proof-of-work",
-    "post-quantum",
-    "pow",
-    "crypto",
-    "multithreaded",
-    "gpu",
-    "cuda"
+    "hash256", "ethereum", "miner", "cli", "proof-of-work",
+    "post-quantum", "pow", "crypto", "gpu", "cuda", "h100"
   ],
-  "author": "",
+  "author": "ulsreall",
   "license": "MIT",
   "dependencies": {
     "dotenv": "^16.4.7",
