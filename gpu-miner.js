@@ -8,15 +8,15 @@ const crypto = require("crypto");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const RPC_URL = process.env.RPC_URL;
-const TX_RPC_URL = process.env.TX_RPC_URL || RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc";
 const MAX_GAS_GWEI = parseFloat(process.env.MAX_GAS_GWEI || "20");
 const GAS_LIMIT = parseInt(process.env.GAS_LIMIT || "300000", 10);
-const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || "1000", 10);
-const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "10");
+const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || "2000", 10);
+const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "2");
 const GAS_REFRESH_MS = parseInt(process.env.GAS_REFRESH_MS || "12000", 10);
 const STATS_INTERVAL = parseInt(process.env.STATS_INTERVAL || "15000", 10);
+const TX_TIMEOUT = parseInt(process.env.TX_TIMEOUT || "60000", 10);
 
 const ABI = [
   "function getChallenge(address miner) view returns (bytes32)",
@@ -108,7 +108,7 @@ function getGpuBinary() {
   process.exit(1);
 }
 
-// ─── Gas Cache ────────────────────────────────────────────────────────────────
+// ─── Gas ──────────────────────────────────────────────────────────────────────
 let cachedGas = { baseGwei: 0, maxFeePerGas: 0n, maxPriorityFeePerGas: 0n, type: 2, ts: 0 };
 
 async function refreshGas(provider) {
@@ -117,8 +117,8 @@ async function refreshGas(provider) {
     const baseFee = feeData.gasPrice || 0n;
     const baseGwei = parseFloat(ethers.formatUnits(baseFee, "gwei"));
     const priorityFee = ethers.parseUnits(PRIORITY_FEE_GWEI.toString(), "gwei");
-    const maxFee = baseFee + priorityFee + priorityFee + priorityFee;
-
+    // maxFee = base * 2 + priority (generous buffer for spikes)
+    const maxFee = baseFee * 2n + priorityFee;
     cachedGas = { baseGwei, maxFeePerGas: maxFee, maxPriorityFeePerGas: priorityFee, type: 2, ts: Date.now() };
   } catch {}
 }
@@ -128,16 +128,17 @@ async function getGasParams(provider) {
   return cachedGas;
 }
 
-// ─── TX Submit ────────────────────────────────────────────────────────────────
-// Uses txProvider for send, provider for receipt (fixes Flashbots hang)
-async function submitMineTx(txContract, provider, nonce, gasParams, hashHex) {
+// ─── Submit + Wait for Confirmation ──────────────────────────────────────────
+// KEY FIX: We WAIT for TX to confirm before submitting next one.
+// This prevents nonce chain clog (50 pending, 0 confirmed).
+// Mining continues in parallel — only TX submission is serialized.
+async function submitAndWait(contract, provider, nonce, gasParams, hashHex) {
   stats.txSent++;
   stats.txPending++;
-
   const shortHash = hashHex.slice(0, 10) + "…";
 
   try {
-    const tx = await txContract.mine(nonce, {
+    const tx = await contract.mine(nonce, {
       gasLimit: GAS_LIMIT,
       type: gasParams.type,
       maxFeePerGas: gasParams.maxFeePerGas,
@@ -147,43 +148,31 @@ async function submitMineTx(txContract, provider, nonce, gasParams, hashHex) {
     const shortTx = tx.hash.slice(0, 10) + "…";
     log(`📤 ${shortHash} → ${shortTx}  [etherscan.io/tx/${tx.hash}]`);
 
-    // Wait for receipt on regular provider (not Flashbots — avoids hang)
-    provider.waitForTransaction(tx.hash, 1, 120_000)
-      .then((receipt) => {
-        if (receipt) {
-          stats.txSuccess++;
-          stats.txPending--;
-          log(`✅ ${shortTx} confirmed in block ${receipt.blockNumber}  [${stats.txSuccess}/${stats.txSent}]`);
-        } else {
-          stats.txFailed++;
-          stats.txPending--;
-          log(`⏭️ ${shortTx} receipt null — TX may have failed`);
-        }
-      })
-      .catch((err) => {
-        stats.txFailed++;
-        stats.txPending--;
-        const msg = err.shortMessage || err.message || String(err);
-        if (msg.includes("InsufficientWork") || msg.includes("already mined")) {
-          log(`⏭️ ${shortTx} already mined — skipped`);
-        } else if (msg.includes("timeout") || msg.includes("Timed out")) {
-          log(`⏱️ ${shortTx} receipt timeout — may still confirm later`);
-        } else {
-          log(`❌ ${shortTx} failed: ${msg.slice(0, 80)}`);
-        }
-      });
+    // WAIT for receipt — this is the key difference
+    const receipt = await provider.waitForTransaction(tx.hash, 1, TX_TIMEOUT);
 
-    return true;
+    if (receipt) {
+      stats.txSuccess++;
+      stats.txPending--;
+      log(`✅ ${shortTx} confirmed in block ${receipt.blockNumber}  [${stats.txSuccess}/${stats.txSent}]`);
+    } else {
+      stats.txFailed++;
+      stats.txPending--;
+      log(`⏭️ ${shortTx} receipt null — TX may have failed`);
+    }
   } catch (err) {
     stats.txFailed++;
     stats.txPending--;
     const msg = err.shortMessage || err.message || String(err);
-    if (msg.includes("nonce")) {
+    if (msg.includes("InsufficientWork") || msg.includes("already mined")) {
+      log(`⏭️ ${shortHash} already mined — skipped`);
+    } else if (msg.includes("nonce")) {
       log(`⏭️ ${shortHash} nonce conflict — skipping`);
+    } else if (msg.includes("timeout") || msg.includes("Timed out")) {
+      log(`⏱️ ${shortHash} TX timeout (${TX_TIMEOUT / 1000}s) — may still confirm`);
     } else {
-      log(`❌ ${shortHash} TX error: ${msg.slice(0, 80)}`);
+      log(`❌ ${shortHash} error: ${msg.slice(0, 80)}`);
     }
-    return false;
   }
 }
 
@@ -228,22 +217,17 @@ async function main() {
   console.log(`╚═══════════════════════════════════════════════════════════════════╝`);
 
   const provider = new ethers.JsonRpcProvider(RPC_URL);
-  const txProvider = TX_RPC_URL !== RPC_URL
-    ? new ethers.JsonRpcProvider(TX_RPC_URL, undefined, { batchMaxCount: 1 })
-    : provider;
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-  const txWallet = new ethers.Wallet(PRIVATE_KEY, txProvider);
   const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
-  const txContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, txWallet);
   const binaryPath = getGpuBinary();
 
   // ─── Startup ────────────────────────────────────────────────────────────────
   console.log();
-  log(`🔑 Wallet:  ${wallet.address}`);
+  log(`🔑 Wallet:   ${wallet.address}`);
   log(`📄 Contract: ${CONTRACT_ADDRESS}`);
-  if (TX_RPC_URL !== RPC_URL) log(`🚀 TX RPC:  ${TX_RPC_URL}`);
-  log(`⛽ Gas:     max ${MAX_GAS_GWEI} gwei | priority ${PRIORITY_FEE_GWEI} gwei`);
-  log(`⚡ GPU:     Starting 1 GPU thread(s). Ctrl+C to stop.`);
+  log(`⛽ Gas:      max ${MAX_GAS_GWEI} gwei | priority ${PRIORITY_FEE_GWEI} gwei`);
+  log(`⏱️ TX timeout: ${TX_TIMEOUT / 1000}s`);
+  log(`⚡ GPU:      Starting 1 GPU thread(s). Ctrl+C to stop.`);
 
   // Pre-flight
   const [balance, gasParams] = await Promise.all([
@@ -269,6 +253,8 @@ async function main() {
   setTimeout(printStats, 10_000);
 
   // ─── Mining Loop ────────────────────────────────────────────────────────────
+  // Mining runs continuously. TX submission blocks until confirmed.
+  // This prevents nonce chain clog — at most 1 TX pending at a time.
   while (true) {
     try {
       const [{ state, challenge }, gasParams] = await Promise.all([
@@ -311,8 +297,9 @@ async function main() {
           const shortHash = hashHex.slice(0, 10) + "…";
           log(`⛽ ${shortHash} skipped — gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei`);
         } else {
-          // Pass regular provider for receipt polling (fixes Flashbots hang)
-          await submitMineTx(txContract, provider, nonce, gasParams, hashHex);
+          // SUBMIT + WAIT — blocks until TX confirmed or timeout
+          // This ensures we never pile up nonces
+          await submitAndWait(contract, provider, nonce, gasParams, hashHex);
         }
       }
 
