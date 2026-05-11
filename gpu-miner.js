@@ -16,6 +16,7 @@ const GAS_LIMIT = parseInt(process.env.GAS_LIMIT || "300000", 10);
 const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || "1000", 10);
 const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "10");
 const GAS_REFRESH_MS = parseInt(process.env.GAS_REFRESH_MS || "12000", 10);
+const STATS_INTERVAL = parseInt(process.env.STATS_INTERVAL || "15000", 10);
 
 const ABI = [
   "function getChallenge(address miner) view returns (bytes32)",
@@ -26,29 +27,39 @@ const ABI = [
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 const ts = () => new Date().toLocaleTimeString("en-GB", { hour12: false });
+const S = (v, w) => String(v).padEnd(w);
+
 function log(msg) {
   console.log(`[${ts()}] ${msg}`);
+}
+
+function logCompact(emoji, msg) {
+  console.log(`[${ts()}] ${emoji} ${msg}`);
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
 const stats = {
   startTime: Date.now(),
   solutionsFound: 0,
+  txSent: 0,
   txSuccess: 0,
   txFailed: 0,
   txPending: 0,
   roundsCompleted: 0,
   lastGpuHashrate: "N/A",
   gasSkipped: 0,
+  lastEpoch: "",
+  lastReward: "0",
+  lastEra: "0",
+  lastHashBal: "?",
+  lastEthBal: "?",
 };
 
 function formatUptime(ms) {
   const s = Math.floor(ms / 1000);
-  const d = Math.floor(s / 86400);
-  const h = Math.floor((s % 86400) / 3600);
+  const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
-  if (d > 0) return `${d}d ${h}h ${m}m`;
   if (h > 0) return `${h}h ${m}m ${sec}s`;
   if (m > 0) return `${m}m ${sec}s`;
   return `${sec}s`;
@@ -56,19 +67,33 @@ function formatUptime(ms) {
 
 function printStats() {
   const uptime = formatUptime(Date.now() - stats.startTime);
-  const gpuHr = stats.lastGpuHashrate.padEnd(16);
-  const rounds = String(stats.roundsCompleted).padEnd(18);
-  const found = String(stats.solutionsFound).padEnd(19);
-  const ok = String(stats.txSuccess).padEnd(19);
+  const hr = stats.lastGpuHashrate;
+  const rounds = stats.roundsCompleted;
+  const found = stats.solutionsFound;
+  const ok = stats.txSuccess;
   const fail = stats.txFailed;
+  const pending = stats.txPending;
+  const skipped = stats.gasSkipped;
+  const sent = stats.txSent;
+  const confirmRate = sent > 0 ? ((ok / sent) * 100).toFixed(0) : "0";
 
-  console.log(`──────────────────────────────────────────────────────────────────`);
-  console.log(`  ⚡️ GPU ${gpuHr}│ Rounds ${rounds}│ Uptime ${uptime}`);
-  console.log(`  🎯 Found ${found}│ TX OK ${ok}│ TX Fail ${fail}`);
-  if (stats.txPending > 0 || stats.gasSkipped > 0) {
-    console.log(`  ⏳ Pending: ${stats.txPending}     │ ⛽ Gas-skipped: ${stats.gasSkipped}`);
-  }
-  console.log(`──────────────────────────────────────────────────────────────────`);
+  console.log();
+  console.log(`┌─────────────────────────────────────────────────────────────────┐`);
+  console.log(`│  📊 MINING STATUS                                               │`);
+  console.log(`├─────────────────────────────────────────────────────────────────┤`);
+  console.log(`│  ⚡ Hashrate    ${S(hr, 20)}│ 🕐 Uptime   ${S(uptime, 18)}│`);
+  console.log(`│  🔄 Rounds      ${S(rounds, 20)}│ 🎯 Found    ${S(found, 18)}│`);
+  console.log(`│  📤 TX Sent     ${S(sent, 20)}│ ✅ Confirmed ${S(ok, 18)}│`);
+  console.log(`│  ❌ Failed      ${S(fail, 20)}│ ⏳ Pending   ${S(pending, 18)}│`);
+  console.log(`│  ⛽ Gas-skipped ${S(skipped, 20)}│ 📈 Confirm % ${S(confirmRate + "%", 18)}│`);
+  console.log(`├─────────────────────────────────────────────────────────────────┤`);
+  console.log(`│  🪙 HASH Balance: ${S(stats.lastHashBal, 48)}│`);
+  console.log(`│  💰 ETH Balance:  ${S(stats.lastEthBal, 48)}│`);
+  console.log(`│  ⛽ Base Fee:     ${S(stats.lastBaseGwei || "—", 48)}│`);
+  console.log(`│  🔄 Epoch:        ${S(stats.lastEpoch || "—", 48)}│`);
+  console.log(`│  🏆 Reward:       ${S(stats.lastReward + " HASH", 48)}│`);
+  console.log(`└─────────────────────────────────────────────────────────────────┘`);
+  console.log();
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
@@ -111,7 +136,8 @@ async function getGasParams(provider) {
 }
 
 // ─── TX Submit ────────────────────────────────────────────────────────────────
-async function submitMineTx(contract, nonce, gasParams) {
+async function submitMineTx(contract, nonce, gasParams, hashHex) {
+  stats.txSent++;
   stats.txPending++;
 
   try {
@@ -122,24 +148,26 @@ async function submitMineTx(contract, nonce, gasParams) {
       maxPriorityFeePerGas: gasParams.maxPriorityFeePerGas,
     });
 
-    log(`📤 TX sent: https://etherscan.io/tx/${tx.hash}`);
+    const shortHash = hashHex.slice(0, 10) + "…";
+    const shortTx = tx.hash.slice(0, 10) + "…";
+    logCompact("📤", `${shortHash} → ${shortTx}  [etherscan.io/tx/${tx.hash}]`);
 
     tx.wait()
       .then((receipt) => {
         stats.txSuccess++;
         stats.txPending--;
-        log(`✅ Confirmed in block ${receipt.blockNumber}`);
+        logCompact("✅", `${shortTx} confirmed in block ${receipt.blockNumber}  [${stats.txSuccess}/${stats.txSent}]`);
       })
       .catch((err) => {
         stats.txFailed++;
         stats.txPending--;
         const msg = err.shortMessage || err.message || String(err);
         if (msg.includes("InsufficientWork") || msg.includes("already mined")) {
-          log("⏭️ Already mined — skipping");
+          logCompact("⏭️", `${shortTx} already mined — skipped`);
         } else if (msg.includes("missing response") || msg.includes("BAD_DATA")) {
-          log("⏭️ RPC rate limited — TX may still confirm");
+          logCompact("⏭️", `${shortTx} RPC rate limited — may still confirm`);
         } else {
-          log(`✗ TX failed: ${msg.slice(0, 100)}`);
+          logCompact("❌", `${shortTx} failed: ${msg.slice(0, 80)}`);
         }
       });
 
@@ -149,9 +177,9 @@ async function submitMineTx(contract, nonce, gasParams) {
     stats.txPending--;
     const msg = err.shortMessage || err.message || String(err);
     if (msg.includes("nonce")) {
-      log("⏭️ Nonce conflict — skipping");
+      logCompact("⏭️", "Nonce conflict — skipping");
     } else {
-      log(`✗ TX error: ${msg.slice(0, 100)}`);
+      logCompact("❌", `TX error: ${msg.slice(0, 80)}`);
     }
     return false;
   }
@@ -193,9 +221,9 @@ function runGpuMiner(binaryPath, challengeHex, difficultyHex, startNonce) {
 async function main() {
   requireEnv();
 
-  console.log(`╔═══════════════════════════════════════════════════════════════╗`);
-  console.log(`║  HASH256 Multi-GPU Miner                                    ║`);
-  console.log(`╚═══════════════════════════════════════════════════════════════╝`);
+  console.log(`╔═══════════════════════════════════════════════════════════════════╗`);
+  console.log(`║  HASH256 Multi-GPU Miner                                        ║`);
+  console.log(`╚═══════════════════════════════════════════════════════════════════╝`);
 
   const provider = new ethers.JsonRpcProvider(RPC_URL);
   const txProvider = TX_RPC_URL !== RPC_URL
@@ -207,28 +235,39 @@ async function main() {
   const txContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, txWallet);
   const binaryPath = getGpuBinary();
 
-  const gpuThreads = parseInt(process.env.GPU_THREADS || "1", 10);
-  log(`[miner] Starting ${gpuThreads} GPU thread(s). Ctrl+C to stop.`);
+  // ─── Startup Info ───────────────────────────────────────────────────────────
   console.log();
+  log(`🔑 Wallet:  ${wallet.address}`);
+  log(`📄 Contract: ${CONTRACT_ADDRESS}`);
+  if (TX_RPC_URL !== RPC_URL) log(`🚀 TX RPC:  ${TX_RPC_URL}`);
+  log(`⛽ Gas:     max ${MAX_GAS_GWEI} gwei | priority ${PRIORITY_FEE_GWEI} gwei`);
+  log(`⚡ GPU:     Starting 1 GPU thread(s). Ctrl+C to stop.`);
 
-  // Pre-flight
-  const balance = await provider.getBalance(wallet.address);
+  // Pre-flight: parallel balance + gas + hash
+  const [balance, gasParams] = await Promise.all([
+    provider.getBalance(wallet.address),
+    getGasParams(provider),
+  ]);
+
   if (balance === 0n) { log("✗ No ETH! Fund wallet."); process.exit(1); }
 
   try {
     const hashBal = await contract.balanceOf(wallet.address);
-    const ethBal = parseFloat(ethers.formatEther(balance));
-    log(`🪙 HASH: ${ethers.formatUnits(hashBal, 18)} | ETH: ${ethBal.toFixed(6)}`);
+    stats.lastHashBal = ethers.formatUnits(hashBal, 18);
   } catch {}
+  stats.lastEthBal = `${parseFloat(ethers.formatEther(balance)).toFixed(6)} ETH`;
+  stats.lastBaseGwei = `${gasParams.baseGwei.toFixed(1)} gwei`;
 
-  if (TX_RPC_URL !== RPC_URL) log(`🚀 TX RPC: ${TX_RPC_URL}`);
+  console.log();
+  log(`🪙 HASH: ${stats.lastHashBal} | ETH: ${stats.lastEthBal}`);
+  log(`⛽ Base fee: ${stats.lastBaseGwei}`);
   console.log();
 
-  setInterval(printStats, 30_000);
-  setTimeout(printStats, 5_000);
+  // ─── Stats Printer ──────────────────────────────────────────────────────────
+  setInterval(printStats, STATS_INTERVAL);
+  setTimeout(printStats, 10_000);
 
-  let lastEpoch = "";
-
+  // ─── Mining Loop ────────────────────────────────────────────────────────────
   while (true) {
     try {
       const [{ state, challenge }, gasParams] = await Promise.all([
@@ -238,13 +277,21 @@ async function main() {
 
       const difficulty = BigInt(state.difficulty.toString());
       const epoch = state.epoch.toString();
+      const era = state.era.toString();
+      const reward = ethers.formatUnits(state.reward, 18);
 
-      if (epoch !== lastEpoch) {
-        lastEpoch = epoch;
-        const reward = ethers.formatUnits(state.reward, 18);
-        const era = state.era.toString();
-        console.log();
-        log(`🔄 New epoch ${epoch} | Era ${era} | Reward ${reward} HASH`);
+      // Epoch change
+      if (epoch !== stats.lastEpoch) {
+        stats.lastEpoch = epoch;
+        stats.lastEra = era;
+        stats.lastReward = reward;
+        stats.lastBaseGwei = `${gasParams.baseGwei.toFixed(1)} gwei`;
+
+        if (epoch !== "0") {
+          console.log();
+          log(`🔄 New epoch ${epoch} | Era ${era} | Reward ${reward} HASH | Difficulty ${difficulty}`);
+          console.log();
+        }
       }
 
       const challengeHex = challenge.startsWith("0x") ? challenge.slice(2) : challenge;
@@ -257,14 +304,14 @@ async function main() {
       if (result.found) {
         stats.solutionsFound++;
         const nonce = BigInt(result.nonce);
-        log(`🎯 FOUND nonce: ${nonce}`);
-        log(`    Hash: ${result.hash}`);
+        const hashHex = result.hash;
 
         if (gasParams.baseGwei > MAX_GAS_GWEI) {
           stats.gasSkipped++;
-          log(`⛽ Gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei — skipped`);
+          const shortHash = hashHex.slice(0, 10) + "…";
+          logCompact("⛽", `${shortHash} skipped — gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei`);
         } else {
-          await submitMineTx(txContract, nonce, gasParams);
+          await submitMineTx(txContract, nonce, gasParams, hashHex);
         }
       }
 
@@ -276,10 +323,10 @@ async function main() {
   }
 }
 
+// ─── Shutdown ─────────────────────────────────────────────────────────────────
 process.on("SIGINT", () => {
   console.log();
   log("🛑 Shutting down...");
-  if (stats.txPending > 0) log(`⏳ ${stats.txPending} TXs still pending`);
   printStats();
   process.exit(0);
 });
@@ -292,8 +339,8 @@ process.on("SIGTERM", () => {
 process.on("uncaughtException", (err) => {
   const msg = err.message || String(err);
   if (msg.includes("missing response") || msg.includes("BAD_DATA")) {
-    log("⏭️ RPC batch error caught — continuing...");
-    return; // don't crash
+    log("⏭️ RPC batch error — continuing...");
+    return;
   }
   log(`✗ Uncaught: ${msg}`);
   process.exit(1);
