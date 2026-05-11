@@ -1,0 +1,36 @@
+[package]
+name = "hash256-miner"
+version = "8.0.0"
+edition = "2021"
+description = "High-performance OpenCL GPU miner for HASH256 — fire-and-forget TX with receipt tracking"
+license = "MIT"
+
+[dependencies]
+alloy = { version = "0.8", features = [
+    "providers",
+    "signers",
+    "signer-local",
+    "sol-types",
+    "contract",
+    "network",
+    "rpc-types-eth",
+    "reqwest",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+eyre = "0.6"
+rpassword = "7"
+num_cpus = "1"
+rand = "0.8"
+dotenvy = "0.15"
+ocl = { version = "0.19", optional = true }
+hex = "0.4"
+
+[features]
+default = ["gpu"]
+gpu = ["dep:ocl"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

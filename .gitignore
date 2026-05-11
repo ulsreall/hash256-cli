@@ -1,10 +1,5 @@
+target/
 node_modules/
 .env
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-.DS_Store
-gpu-miner
-*.o
-*.obj
+*.exe
+*.pdb
