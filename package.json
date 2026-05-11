@@ -1,7 +1,7 @@
 {
   "name": "hash256-cli",
-  "version": "1.0.0",
-  "description": "CLI miner for HASH256 on Ethereum mainnet.",
+  "version": "2.0.0",
+  "description": "CLI miner for HASH256 ($HASH) — browser-mined post-quantum token on Ethereum mainnet.",
   "main": "miner.js",
   "scripts": {
     "start": "node miner.js",
@@ -11,7 +11,11 @@
     "hash256",
     "ethereum",
     "miner",
-    "cli"
+    "cli",
+    "proof-of-work",
+    "post-quantum",
+    "pow",
+    "crypto"
   ],
   "author": "",
   "license": "MIT",
