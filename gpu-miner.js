@@ -14,7 +14,8 @@ const CONTRACT_ADDRESS = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc";
 const MAX_GAS_GWEI = parseFloat(process.env.MAX_GAS_GWEI || "100");
 const GAS_LIMIT = parseInt(process.env.GAS_LIMIT || "300000", 10);
 const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || "1000", 10);
-const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "3");
+const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "10");
+const MAX_PENDING_TX = parseInt(process.env.MAX_PENDING_TX || "3", 10);
 
 const ABI = [
   "function getChallenge(address miner) view returns (bytes32)",
@@ -124,7 +125,7 @@ async function getGasParams(provider) {
 
     // EIP-1559: priority fee on top of base fee for faster inclusion
     const priorityFee = ethers.parseUnits(PRIORITY_FEE_GWEI.toString(), "gwei");
-    const maxFee = baseFee + priorityFee + priorityFee; // 2x priority as buffer
+    const maxFee = baseFee + priorityFee + priorityFee + priorityFee; // 3x priority as buffer
 
     return {
       baseGwei,
@@ -184,6 +185,18 @@ async function submitMineTx(contract, nonce, gasParams) {
   }
 }
 
+// ─── Wait for pending TXs to confirm ───────────────────────────────────────
+function waitForConfirm(provider, maxPending) {
+  return new Promise((resolve) => {
+    const check = setInterval(() => {
+      if (stats.txPending <= maxPending) {
+        clearInterval(check);
+        resolve();
+      }
+    }, 2000);
+  });
+}
+
 // ─── Run GPU Miner ────────────────────────────────────────────────────────────
 function runGpuMiner(binaryPath, challengeHex, difficultyHex, startNonce) {
   return new Promise((resolve) => {
@@ -234,7 +247,7 @@ async function main() {
   console.log(`${C.dim}│${C.reset}  ⛽ Max Gas     ${C.white}${MAX_GAS_GWEI} gwei${C.reset}`);
   console.log(`${C.dim}│${C.reset}  💨 Priority    ${C.white}${PRIORITY_FEE_GWEI} gwei (EIP-1559)${C.reset}`);
   console.log(`${C.dim}│${C.reset}  📦 Gas Limit   ${C.white}${GAS_LIMIT.toLocaleString()}${C.reset}`);
-  console.log(`${C.dim}│${C.reset}  🔄 Fire&Forget ${C.white}ON (TX runs in background)${C.reset}`);
+  console.log(`${C.dim}│${C.reset}  🔄 Fire&Forget ${C.white}ON (max ${MAX_PENDING_TX} pending TXs)${C.reset}`);
   console.log(`${C.dim}└──────────────────────────────────────────────────────────────┘${C.reset}`);
   console.log();
 
@@ -317,6 +330,12 @@ async function main() {
 
         if (gasParams.baseGwei > MAX_GAS_GWEI) {
           log("⛽", C.yellow, `Gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei — still submitting (fire-and-forget)`);
+        }
+
+        // Wait if too many pending TXs (avoid nonce chain clog)
+        if (stats.txPending >= MAX_PENDING_TX) {
+          log("⏳", C.yellow, `${stats.txPending} pending TXs — waiting for confirm before submitting...`);
+          await waitForConfirm(provider, MAX_PENDING_TX - 1);
         }
 
         // Fire-and-forget: submit TX and immediately continue mining
