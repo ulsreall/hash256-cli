@@ -9,6 +9,9 @@ const crypto = require("crypto");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const RPC_URL = process.env.RPC_URL;
+// Separate TX submission RPC (MEV-protected, faster inclusion)
+// Falls back to RPC_URL if not set
+const TX_RPC_URL = process.env.TX_RPC_URL || RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc";
 const MAX_GAS_GWEI = parseFloat(process.env.MAX_GAS_GWEI || "20");
@@ -241,8 +244,14 @@ async function main() {
   banner();
 
   const provider = new ethers.JsonRpcProvider(RPC_URL);
+  // TX provider: separate RPC for submission (MEV-protected / fast)
+  const txProvider = TX_RPC_URL !== RPC_URL
+    ? new ethers.JsonRpcProvider(TX_RPC_URL)
+    : provider;
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+  const txWallet = new ethers.Wallet(PRIVATE_KEY, txProvider);
   const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
+  const txContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, txWallet);
   const binaryPath = getGpuBinary();
 
   console.log(`${C.dim}┌─ Configuration ──────────────────────────────────────────────┐${C.reset}`);
@@ -253,6 +262,9 @@ async function main() {
   console.log(`${C.dim}│${C.reset}  💨 Priority    ${C.white}${PRIORITY_FEE_GWEI} gwei (EIP-1559)${C.reset}`);
   console.log(`${C.dim}│${C.reset}  📦 Gas Limit   ${C.white}${GAS_LIMIT.toLocaleString()}${C.reset}`);
   console.log(`${C.dim}│${C.reset}  📡 Gas Cache   ${C.white}${GAS_REFRESH_MS / 1000}s${C.reset}`);
+  if (TX_RPC_URL !== RPC_URL) {
+    console.log(`${C.dim}│${C.reset}  🚀 TX RPC      ${C.white}${TX_RPC_URL.replace(/https?:\/\//, '').slice(0, 40)}${C.reset}`);
+  }
   console.log(`${C.dim}│${C.reset}  🚀 Mode        ${C.white}FULL SEND (no throttle)${C.reset}`);
   console.log(`${C.dim}└──────────────────────────────────────────────────────────────┘${C.reset}`);
   console.log();
@@ -330,8 +342,8 @@ async function main() {
           stats.gasSkipped++;
           log("⛽", C.yellow + C.bold, `Gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei — SKIPPED`);
         } else {
-          // FULL SEND — no throttle, fire immediately
-          await submitMineTx(contract, nonce, gasParams);
+          // FULL SEND — fire immediately via TX RPC (MEV-protected)
+          await submitMineTx(txContract, nonce, gasParams);
         }
       }
 
