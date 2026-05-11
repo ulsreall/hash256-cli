@@ -16,6 +16,7 @@ const GAS_LIMIT = parseInt(process.env.GAS_LIMIT || "300000", 10);
 const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || "1000", 10);
 const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "10");
 const MAX_PENDING_TX = parseInt(process.env.MAX_PENDING_TX || "3", 10);
+const GAS_REFRESH_MS = parseInt(process.env.GAS_REFRESH_MS || "12000", 10); // refresh gas every 12s
 
 const ABI = [
   "function getChallenge(address miner) view returns (bytes32)",
@@ -46,7 +47,7 @@ ${C.cyan}${C.bold}  ███████║███████║████
 ${C.cyan}${C.bold}  ██╔══██║██╔══██║╚════██║██╔══██║  ${C.reset}
 ${C.cyan}${C.bold}  ██║  ██║██║  ██║███████║██║  ██║  ${C.reset}
 ${C.cyan}${C.bold}  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝  ${C.reset}
-${C.magenta}  GPU Miner v3.5 · High-Speed TX · hash256.org${C.reset}
+${C.magenta}  GPU Miner v4.0 · Optimized TX · hash256.org${C.reset}
 ${C.dim}  ${cpuModel.trim().slice(0, 50)} · ${totalMem} GB RAM${C.reset}
 `);
 }
@@ -60,6 +61,7 @@ const stats = {
   txPending: 0,
   roundsCompleted: 0,
   lastGpuHashrate: "N/A",
+  gasSkipped: 0,
 };
 
 function formatDuration(ms) {
@@ -86,11 +88,12 @@ function printStats() {
   console.log(
     `  ${C.cyan}🎯 Found${C.green} ${String(stats.solutionsFound).padEnd(13)}${C.dim}│${C.reset} ` +
     `${C.cyan}TX OK${C.green} ${String(stats.txSuccess).padEnd(15)}${C.dim}│${C.reset} ` +
-    `${C.cyan}TX Fail${C.red} ${stats.txFailed}`
+    `${C.cyan}Fail${C.red} ${stats.txFailed}`
   );
-  if (stats.txPending > 0) {
+  if (stats.txPending > 0 || stats.gasSkipped > 0) {
     console.log(
-      `  ${C.yellow}⏳ Pending TXs: ${stats.txPending}${C.reset}`
+      `  ${C.yellow}⏳ Pending${C.white} ${stats.txPending}${C.dim}  │${C.reset} ` +
+      `${C.yellow}⛽ Gas-skipped${C.white} ${stats.gasSkipped}${C.reset}`
     );
   }
   console.log(sep);
@@ -116,30 +119,38 @@ function getGpuBinary() {
   process.exit(1);
 }
 
-// ─── Gas Helpers ──────────────────────────────────────────────────────────────
-async function getGasParams(provider) {
+// ─── Gas Cache ────────────────────────────────────────────────────────────────
+// Cache gas params, refresh every GAS_REFRESH_MS to avoid RPC spam
+let cachedGas = { baseGwei: 0, maxFeePerGas: 0n, maxPriorityFeePerGas: 0n, type: 2, ts: 0 };
+
+async function refreshGas(provider) {
   try {
     const feeData = await provider.getFeeData();
     const baseFee = feeData.gasPrice || 0n;
     const baseGwei = parseFloat(ethers.formatUnits(baseFee, "gwei"));
-
-    // EIP-1559: priority fee on top of base fee for faster inclusion
     const priorityFee = ethers.parseUnits(PRIORITY_FEE_GWEI.toString(), "gwei");
-    const maxFee = baseFee + priorityFee + priorityFee + priorityFee; // 3x priority as buffer
+    const maxFee = baseFee + priorityFee + priorityFee + priorityFee;
 
-    return {
+    cachedGas = {
       baseGwei,
       maxFeePerGas: maxFee,
       maxPriorityFeePerGas: priorityFee,
-      type: 2, // EIP-1559
+      type: 2,
+      ts: Date.now(),
     };
-  } catch {
-    return { baseGwei: 0, maxFeePerGas: 0n, maxPriorityFeePerGas: 0n, type: 0 };
+  } catch (err) {
+    log("⛽", C.yellow, `Gas refresh failed: ${err.shortMessage || err.message}`);
   }
 }
 
+async function getGasParams(provider) {
+  if (Date.now() - cachedGas.ts > GAS_REFRESH_MS) {
+    await refreshGas(provider);
+  }
+  return cachedGas;
+}
+
 // ─── Fire-and-forget TX submit ────────────────────────────────────────────────
-// Don't wait for receipt — just fire TX and immediately start next mining round
 async function submitMineTx(contract, nonce, gasParams) {
   stats.txPending++;
 
@@ -186,7 +197,7 @@ async function submitMineTx(contract, nonce, gasParams) {
 }
 
 // ─── Wait for pending TXs to confirm ───────────────────────────────────────
-function waitForConfirm(provider, maxPending) {
+function waitForConfirm(maxPending) {
   return new Promise((resolve) => {
     const check = setInterval(() => {
       if (stats.txPending <= maxPending) {
@@ -195,6 +206,15 @@ function waitForConfirm(provider, maxPending) {
       }
     }, 2000);
   });
+}
+
+// ─── Parallel RPC: miningState + getChallenge ───────────────────────────────
+async function fetchChainState(contract, walletAddr) {
+  const [state, challenge] = await Promise.all([
+    contract.miningState(),
+    contract.getChallenge(walletAddr),
+  ]);
+  return { state, challenge };
 }
 
 // ─── Run GPU Miner ────────────────────────────────────────────────────────────
@@ -247,12 +267,17 @@ async function main() {
   console.log(`${C.dim}│${C.reset}  ⛽ Max Gas     ${C.white}${MAX_GAS_GWEI} gwei${C.reset}`);
   console.log(`${C.dim}│${C.reset}  💨 Priority    ${C.white}${PRIORITY_FEE_GWEI} gwei (EIP-1559)${C.reset}`);
   console.log(`${C.dim}│${C.reset}  📦 Gas Limit   ${C.white}${GAS_LIMIT.toLocaleString()}${C.reset}`);
-  console.log(`${C.dim}│${C.reset}  🔄 Fire&Forget ${C.white}ON (max ${MAX_PENDING_TX} pending TXs)${C.reset}`);
+  console.log(`${C.dim}│${C.reset}  🔄 Max Pending ${C.white}${MAX_PENDING_TX} TXs${C.reset}`);
+  console.log(`${C.dim}│${C.reset}  📡 Gas Refresh ${C.white}${GAS_REFRESH_MS / 1000}s${C.reset}`);
   console.log(`${C.dim}└──────────────────────────────────────────────────────────────┘${C.reset}`);
   console.log();
 
-  // Pre-flight
-  const balance = await provider.getBalance(wallet.address);
+  // Pre-flight: parallel balance + hash + gas check
+  const [balance, gasParams] = await Promise.all([
+    provider.getBalance(wallet.address),
+    getGasParams(provider),
+  ]);
+
   const ethBal = parseFloat(ethers.formatEther(balance));
   log("💰", C.cyan, `ETH Balance: ${C.white}${ethBal.toFixed(6)} ETH`);
   if (balance === 0n) { log("✗", C.red, "No ETH! Fund wallet."); process.exit(1); }
@@ -262,35 +287,32 @@ async function main() {
     log("🪙", C.cyan, `HASH Balance: ${C.white}${ethers.formatUnits(hashBal, 18)} HASH`);
   } catch {}
 
-  const { baseGwei } = await getGasParams(provider);
-  log("⛽", C.cyan, `Base Fee:     ${C.white}${baseGwei.toFixed(1)} gwei`);
+  log("⛽", C.cyan, `Base Fee:     ${C.white}${gasParams.baseGwei.toFixed(1)} gwei`);
   console.log();
-  log("⛏ ", C.magenta + C.bold, "GPU Mining started! Fire-and-forget TX mode. Ctrl+C to stop.");
+  log("⛏ ", C.magenta + C.bold, "GPU Mining started! Optimized TX mode. Ctrl+C to stop.");
   console.log();
 
   setInterval(printStats, 30_000);
   setTimeout(printStats, 5_000);
 
-  // Track pending nonces to avoid re-mining same challenge
   let lastEpoch = "";
-  let mining = false;
 
   while (true) {
     try {
-      if (mining) {
-        await sleep(500);
-        continue;
-      }
+      // Parallel: fetch state + gas in one round-trip
+      const [{ state, challenge }, gasParams] = await Promise.all([
+        fetchChainState(contract, wallet.address),
+        getGasParams(provider),
+      ]);
 
-      const state = await contract.miningState();
       const difficulty = BigInt(state.difficulty.toString());
       const era = state.era.toString();
       const reward = ethers.formatUnits(state.reward, 18);
       const epoch = state.epoch.toString();
       const minted = state.minted.toString();
       const remaining = state.remaining.toString();
-      const challenge = await contract.getChallenge(wallet.address);
 
+      // Log epoch change
       if (epoch !== lastEpoch) {
         lastEpoch = epoch;
         stats.roundsCompleted = 0;
@@ -311,12 +333,9 @@ async function main() {
       const difficultyHex = difficulty.toString(16).padStart(64, "0");
       const startNonce = BigInt("0x" + crypto.randomBytes(8).toString("hex"));
 
-      mining = true;
-
       // Run GPU miner
       const result = await runGpuMiner(binaryPath, challengeHex, difficultyHex, startNonce);
       stats.roundsCompleted++;
-      mining = false;
 
       if (result.found) {
         stats.solutionsFound++;
@@ -325,33 +344,26 @@ async function main() {
         log("🎯", C.green + C.bold, `FOUND nonce: ${C.white}${nonce}`);
         log("   ", C.dim, `Hash: ${result.hash}`);
 
-        // Get gas params — with EIP-1559 priority fee for fast inclusion
-        const gasParams = await getGasParams(provider);
-
+        // Gas check: skip if too expensive (save ETH!)
         if (gasParams.baseGwei > MAX_GAS_GWEI) {
-          log("⛽", C.yellow, `Gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei — still submitting (fire-and-forget)`);
+          stats.gasSkipped++;
+          log("⛽", C.yellow + C.bold, `Gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei — SKIPPED (saving ETH)`);
+          log("   ", C.dim, `Increase MAX_GAS_GWEI in .env to submit at higher gas`);
+        } else {
+          // Wait if too many pending TXs
+          if (stats.txPending >= MAX_PENDING_TX) {
+            log("⏳", C.yellow, `${stats.txPending} pending TXs — waiting for confirm...`);
+            await waitForConfirm(MAX_PENDING_TX - 1);
+          }
+
+          await submitMineTx(contract, nonce, gasParams);
         }
-
-        // Wait if too many pending TXs (avoid nonce chain clog)
-        if (stats.txPending >= MAX_PENDING_TX) {
-          log("⏳", C.yellow, `${stats.txPending} pending TXs — waiting for confirm before submitting...`);
-          await waitForConfirm(provider, MAX_PENDING_TX - 1);
-        }
-
-        // Fire-and-forget: submit TX and immediately continue mining
-        await submitMineTx(contract, nonce, gasParams);
-
-        // Don't sleep — immediately start next mining round!
-        // The GPU can find another solution before this TX is even confirmed
       }
 
-      // Small yield (no sleep if found — go fast!)
-      if (!result.found) await sleep(500);
-
+      // No sleep — loop immediately after GPU result
     } catch (err) {
       const msg = err.shortMessage || err.message || String(err);
       log("✗", C.red, `Error: ${msg}`);
-      mining = false;
       await sleep(RETRY_DELAY);
     }
   }
@@ -363,6 +375,7 @@ process.on("SIGINT", () => {
   console.log();
   log("🛑", C.yellow, "Shutting down...");
   if (stats.txPending > 0) log("⏳", C.yellow, `${stats.txPending} TXs still pending`);
+  if (stats.gasSkipped > 0) log("⛽", C.yellow, `${stats.gasSkipped} solutions skipped (high gas)`);
   printStats();
   process.exit(0);
 });
