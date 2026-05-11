@@ -15,8 +15,7 @@ const MAX_GAS_GWEI = parseFloat(process.env.MAX_GAS_GWEI || "20");
 const GAS_LIMIT = parseInt(process.env.GAS_LIMIT || "300000", 10);
 const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || "1000", 10);
 const PRIORITY_FEE_GWEI = parseFloat(process.env.PRIORITY_FEE_GWEI || "10");
-const MAX_PENDING_TX = parseInt(process.env.MAX_PENDING_TX || "3", 10);
-const GAS_REFRESH_MS = parseInt(process.env.GAS_REFRESH_MS || "12000", 10); // refresh gas every 12s
+const GAS_REFRESH_MS = parseInt(process.env.GAS_REFRESH_MS || "12000", 10);
 
 const ABI = [
   "function getChallenge(address miner) view returns (bytes32)",
@@ -47,7 +46,7 @@ ${C.cyan}${C.bold}  ███████║███████║████
 ${C.cyan}${C.bold}  ██╔══██║██╔══██║╚════██║██╔══██║  ${C.reset}
 ${C.cyan}${C.bold}  ██║  ██║██║  ██║███████║██║  ██║  ${C.reset}
 ${C.cyan}${C.bold}  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝  ${C.reset}
-${C.magenta}  GPU Miner v4.0 · Optimized TX · hash256.org${C.reset}
+${C.magenta}  GPU Miner v4.1 · Full Send · hash256.org${C.reset}
 ${C.dim}  ${cpuModel.trim().slice(0, 50)} · ${totalMem} GB RAM${C.reset}
 `);
 }
@@ -93,7 +92,7 @@ function printStats() {
   if (stats.txPending > 0 || stats.gasSkipped > 0) {
     console.log(
       `  ${C.yellow}⏳ Pending${C.white} ${stats.txPending}${C.dim}  │${C.reset} ` +
-      `${C.yellow}⛽ Gas-skipped${C.white} ${stats.gasSkipped}${C.reset}`
+      `${C.yellow}⛽ Skipped${C.white} ${stats.gasSkipped}${C.reset}`
     );
   }
   console.log(sep);
@@ -120,7 +119,6 @@ function getGpuBinary() {
 }
 
 // ─── Gas Cache ────────────────────────────────────────────────────────────────
-// Cache gas params, refresh every GAS_REFRESH_MS to avoid RPC spam
 let cachedGas = { baseGwei: 0, maxFeePerGas: 0n, maxPriorityFeePerGas: 0n, type: 2, ts: 0 };
 
 async function refreshGas(provider) {
@@ -164,7 +162,6 @@ async function submitMineTx(contract, nonce, gasParams) {
 
     log("📤", C.blue, `TX sent: ${C.white}https://etherscan.io/tx/${tx.hash}`);
 
-    // Fire-and-forget: wait for receipt in background
     tx.wait()
       .then((receipt) => {
         stats.txSuccess++;
@@ -196,19 +193,7 @@ async function submitMineTx(contract, nonce, gasParams) {
   }
 }
 
-// ─── Wait for pending TXs to confirm ───────────────────────────────────────
-function waitForConfirm(maxPending) {
-  return new Promise((resolve) => {
-    const check = setInterval(() => {
-      if (stats.txPending <= maxPending) {
-        clearInterval(check);
-        resolve();
-      }
-    }, 2000);
-  });
-}
-
-// ─── Parallel RPC: miningState + getChallenge ───────────────────────────────
+// ─── Parallel RPC ────────────────────────────────────────────────────────────
 async function fetchChainState(contract, walletAddr) {
   const [state, challenge] = await Promise.all([
     contract.miningState(),
@@ -267,12 +252,12 @@ async function main() {
   console.log(`${C.dim}│${C.reset}  ⛽ Max Gas     ${C.white}${MAX_GAS_GWEI} gwei${C.reset}`);
   console.log(`${C.dim}│${C.reset}  💨 Priority    ${C.white}${PRIORITY_FEE_GWEI} gwei (EIP-1559)${C.reset}`);
   console.log(`${C.dim}│${C.reset}  📦 Gas Limit   ${C.white}${GAS_LIMIT.toLocaleString()}${C.reset}`);
-  console.log(`${C.dim}│${C.reset}  🔄 Max Pending ${C.white}${MAX_PENDING_TX} TXs${C.reset}`);
-  console.log(`${C.dim}│${C.reset}  📡 Gas Refresh ${C.white}${GAS_REFRESH_MS / 1000}s${C.reset}`);
+  console.log(`${C.dim}│${C.reset}  📡 Gas Cache   ${C.white}${GAS_REFRESH_MS / 1000}s${C.reset}`);
+  console.log(`${C.dim}│${C.reset}  🚀 Mode        ${C.white}FULL SEND (no throttle)${C.reset}`);
   console.log(`${C.dim}└──────────────────────────────────────────────────────────────┘${C.reset}`);
   console.log();
 
-  // Pre-flight: parallel balance + hash + gas check
+  // Pre-flight: parallel
   const [balance, gasParams] = await Promise.all([
     provider.getBalance(wallet.address),
     getGasParams(provider),
@@ -289,7 +274,7 @@ async function main() {
 
   log("⛽", C.cyan, `Base Fee:     ${C.white}${gasParams.baseGwei.toFixed(1)} gwei`);
   console.log();
-  log("⛏ ", C.magenta + C.bold, "GPU Mining started! Optimized TX mode. Ctrl+C to stop.");
+  log("⛏ ", C.magenta + C.bold, "GPU Mining started! Full send mode. Ctrl+C to stop.");
   console.log();
 
   setInterval(printStats, 30_000);
@@ -299,7 +284,6 @@ async function main() {
 
   while (true) {
     try {
-      // Parallel: fetch state + gas in one round-trip
       const [{ state, challenge }, gasParams] = await Promise.all([
         fetchChainState(contract, wallet.address),
         getGasParams(provider),
@@ -312,7 +296,6 @@ async function main() {
       const minted = state.minted.toString();
       const remaining = state.remaining.toString();
 
-      // Log epoch change
       if (epoch !== lastEpoch) {
         lastEpoch = epoch;
         stats.roundsCompleted = 0;
@@ -333,7 +316,6 @@ async function main() {
       const difficultyHex = difficulty.toString(16).padStart(64, "0");
       const startNonce = BigInt("0x" + crypto.randomBytes(8).toString("hex"));
 
-      // Run GPU miner
       const result = await runGpuMiner(binaryPath, challengeHex, difficultyHex, startNonce);
       stats.roundsCompleted++;
 
@@ -344,32 +326,22 @@ async function main() {
         log("🎯", C.green + C.bold, `FOUND nonce: ${C.white}${nonce}`);
         log("   ", C.dim, `Hash: ${result.hash}`);
 
-        // Gas check: skip if too expensive (save ETH!)
         if (gasParams.baseGwei > MAX_GAS_GWEI) {
           stats.gasSkipped++;
-          log("⛽", C.yellow + C.bold, `Gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei — SKIPPED (saving ETH)`);
-          log("   ", C.dim, `Increase MAX_GAS_GWEI in .env to submit at higher gas`);
+          log("⛽", C.yellow + C.bold, `Gas ${gasParams.baseGwei.toFixed(1)} > ${MAX_GAS_GWEI} gwei — SKIPPED`);
         } else {
-          // Wait if too many pending TXs
-          if (stats.txPending >= MAX_PENDING_TX) {
-            log("⏳", C.yellow, `${stats.txPending} pending TXs — waiting for confirm...`);
-            await waitForConfirm(MAX_PENDING_TX - 1);
-          }
-
+          // FULL SEND — no throttle, fire immediately
           await submitMineTx(contract, nonce, gasParams);
         }
       }
 
-      // No sleep — loop immediately after GPU result
     } catch (err) {
       const msg = err.shortMessage || err.message || String(err);
       log("✗", C.red, `Error: ${msg}`);
-      await sleep(RETRY_DELAY);
+      await new Promise(r => setTimeout(r, RETRY_DELAY));
     }
   }
 }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 process.on("SIGINT", () => {
   console.log();
