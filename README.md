@@ -1,16 +1,12 @@
 # HASH256 GPU Miner
 
-High-performance Rust + OpenCL GPU miner for HASH256 (`hash256.org`).
+High-performance Rust GPU miner for HASH256 (`hash256.org`).
 
-## What's New (v8.0)
+## Backends (auto-detected, priority order)
 
-- **Rust + OpenCL** — native GPU mining, no Node.js overhead
-- **Fire-and-forget TX** — submit and mine immediately, don't wait for confirm
-- **Receipt status tracking** — REWARDED vs REVERTED in real-time stats
-- **CPU fallback** — auto-fallback if GPU not available
-- **Smart gas management** — EIP-1559, baseFee×2 + priority
-- **Epoch watchdog** — auto-restart on epoch change via block polling
-- **GPU self-test** — verifies kernel correctness at startup
+1. **CUDA** — standalone binary, fastest (~31 GH/s on RTX 5090)
+2. **OpenCL** — built-in Rust `ocl` crate (~5 GH/s on RTX 5090)
+3. **CPU** — multi-threaded fallback (~500 MH/s)
 
 ## Quick Start
 
@@ -21,30 +17,35 @@ cp .env.example .env
 nano .env  # fill PRIVATE_KEY and RPC_URL
 ```
 
-### Build (GPU)
+### Build CUDA (recommended)
 
 ```bash
-# Install OpenCL (Ubuntu/Debian)
-sudo apt install -y build-essential ocl-icd-opencl-dev
+# Install CUDA toolkit
+sudo apt install -y nvidia-cuda-toolkit
 
-# NVIDIA: install driver + OpenCL runtime
-# AMD: install ROCm/OpenCL runtime
+# Build CUDA binary
+cd native && bash build_cuda.sh && cd ..
 
-# Build
+# Build Rust binary
 cargo build --release
+
+# Run
+GPU=1 ./target/release/hash256-miner
 ```
 
-### Run
+### Build OpenCL (alternative)
 
 ```bash
-# GPU mode (default)
+sudo apt install -y build-essential ocl-icd-opencl-dev
+cargo build --release --features gpu
 GPU=1 ./target/release/hash256-miner
+```
 
-# CPU only
+### CPU only
+
+```bash
+cargo build --release --no-default-features
 GPU=0 ./target/release/hash256-miner
-
-# GPU with custom batch size
-GPU=1 GPU_BATCH=8388608 ./target/release/hash256-miner
 ```
 
 ## Environment Variables
@@ -55,28 +56,19 @@ PRIVATE_KEY=0xYOUR_PRIVATE_KEY
 RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
 
 # GPU
-GPU=1                    # 1 = enable OpenCL GPU, 0 = CPU only
-GPU_BATCH=4194304        # Nonces per GPU dispatch (default: 4M)
+GPU=1                          # 1 = enable GPU, 0 = CPU only
+CUDA_MINER_BIN=./bin/hash256-cuda  # CUDA binary path
+GPU_BATCH=4194304              # OpenCL batch size
 
 # CPU
-MINER_THREADS=8          # CPU threads (default: num CPUs)
+MINER_THREADS=8
 
 # Gas
-PRIORITY_GWEI=5          # EIP-1559 priority fee
-MAX_GAS_GWEI=50          # Skip TX if base fee > this
+PRIORITY_GWEI=5
+MAX_GAS_GWEI=50
 
 # TX Strategy
-MAX_PENDING=2            # Max concurrent pending TXs
-```
-
-## Architecture
-
-```
-src/main.rs           ← Mining loop + TX management (Rust + alloy)
-src/gpu.rs            ← OpenCL GPU backend
-src/keccak_kernel.cl  ← Keccak-256 OpenCL kernel
-Cargo.toml            ← Dependencies (alloy, ocl, tokio)
-build.rs              ← Windows OpenCL linking
+MAX_PENDING=2
 ```
 
 ## TX Strategy
@@ -84,43 +76,33 @@ build.rs              ← Windows OpenCL linking
 ```
 GPU/CPU finds nonce
   ↓
-Gas too high? → Skip (save ETH)
-  ↓
-Too many pending? → Wait for slot (max 2)
-  ↓
 Fire TX immediately (don't wait for receipt)
   ↓
 Background receipt poll (60s timeout)
-  ├── status=1 → ✅ REWARDED (HASH received!)
+  ├── status=1 → ✅ REWARDED
   └── status=0 → ⏮️ REVERTED (someone else was faster)
 ```
 
-## Mining Algorithm
+## Architecture
 
-1. Fetch `challenge` and `difficulty` from contract
-2. GPU/CPU tries nonces: `keccak256(abi.encode(challenge, nonce)) < difficulty`
-3. Found nonce → `mine(nonce)` TX
-4. Repeat for next epoch
+```
+src/main.rs           ← Mining loop + TX management (Rust + alloy)
+src/cuda.rs           ← CUDA backend wrapper (spawns binary)
+src/gpu.rs            ← OpenCL backend (ocl crate)
+src/keccak_kernel.cl  ← OpenCL kernel
+native/cuda_miner.cu  ← CUDA kernel
+native/build_cuda.sh  ← CUDA build script
+Cargo.toml            ← alloy, ocl, tokio
+```
 
 ## Benchmarks
 
 | Backend | GPU | Hashrate |
 |---------|-----|----------|
+| CUDA    | RTX 5090 | ~31 GH/s |
+| CUDA    | RTX 4090 | ~22 GH/s |
 | OpenCL  | RTX 5090 | ~5.2 GH/s |
-| OpenCL  | RTX 4090 | ~3.8 GH/s |
 | CPU     | 8-core | ~500 MH/s |
-
-> Note: CUDA backend coming in future update for higher hashrate.
-
-## Error Reference
-
-| Error | Cause | Fix |
-|-------|-------|-----|
-| `InsufficientWork` | Someone else mined first | Normal — keep mining |
-| `insufficient funds` | No ETH for gas | Fund wallet |
-| `GPU self-test FAILED` | Kernel bug | Report issue |
-| `GenesisNotComplete` | Mining not open yet | Wait for genesis |
-| `clGetDeviceIDs(GPU)` | No OpenCL driver | Install GPU driver |
 
 ## License
 

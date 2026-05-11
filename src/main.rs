@@ -10,6 +10,8 @@ use alloy::sol;
 use eyre::{eyre, Result};
 use rand::Rng;
 
+mod cuda;
+
 #[cfg(feature = "gpu")]
 mod gpu;
 
@@ -210,27 +212,47 @@ async fn main() -> Result<()> {
         Err(e) => eprintln!("[{}] ⚠️ miningState: {}", ts(), e),
     }
 
-    // GPU init
+    // GPU init — try CUDA first, then OpenCL, then CPU
     let gpu_enabled = std::env::var("GPU").ok().as_deref() == Some("1");
+
+    // Try CUDA
+    let cuda_miner: Option<cuda::CudaMiner> = if gpu_enabled {
+        match cuda::CudaMiner::new() {
+            Ok(g) => {
+                println!("[{}] 🎮 CUDA binary found", ts());
+                Some(g)
+            }
+            Err(e) => {
+                eprintln!("[{}] ⚠️ CUDA not available: {}", ts(), e);
+                None
+            }
+        }
+    } else { None };
+
+    // Try OpenCL (fallback)
     #[cfg(feature = "gpu")]
-    let gpu_miner: Option<Arc<gpu::GpuMiner>> = if gpu_enabled {
+    let gpu_miner: Option<Arc<gpu::GpuMiner>> = if cuda_miner.is_none() && gpu_enabled {
         let batch = std::env::var("GPU_BATCH").ok().and_then(|s| s.parse::<usize>().ok());
         match gpu::GpuMiner::new(batch) {
             Ok(g) => {
-                println!("[{}] 🎮 GPU: {} (batch {})", ts(), g.device_name(), g.batch_size());
+                println!("[{}] 🎮 OpenCL: {} (batch {})", ts(), g.device_name(), g.batch_size());
                 match g.self_test() {
                     Ok(()) => println!("[{}] ✅ GPU self-test passed", ts()),
                     Err(e) => return Err(eyre!("GPU self-test FAILED: {e}")),
                 }
                 Some(Arc::new(g))
             }
-            Err(e) => { eprintln!("[{}] ⚠️ GPU failed, CPU fallback: {}", ts(), e); None }
+            Err(e) => { eprintln!("[{}] ⚠️ OpenCL failed, CPU fallback: {}", ts(), e); None }
         }
     } else { None };
     #[cfg(not(feature = "gpu"))]
-    let gpu_miner: Option<()> = { if gpu_enabled { eprintln!("⚠️ GPU=1 but no gpu feature"); } None };
+    let gpu_miner: Option<()> = { if gpu_enabled && cuda_miner.is_none() { eprintln!("⚠️ GPU=1 but no gpu feature"); } None };
 
-    println!();
+    let backend_str = if cuda_miner.is_some() { "CUDA GPU" }
+                      else if gpu_miner.is_some() { "OpenCL GPU" }
+                      else { "CPU" };
+
+    println!("[{}] 🚀 Mining backend: {}", ts(), backend_str);
     println!("[{}] ⛏️ Mining started! Ctrl+C to stop.", ts());
     println!();
 
@@ -275,7 +297,7 @@ async fn main() -> Result<()> {
             Err(e) => { eprintln!("[{}] ❌ Difficulty: {}", ts(), e); tokio::time::sleep(Duration::from_secs(5)).await; continue; }
         };
 
-        let backend = if gpu_miner.is_some() { "GPU" } else { "CPU" };
+        let backend = if cuda_miner.is_some() { "CUDA" } else if gpu_miner.is_some() { "OpenCL" } else { "CPU" };
         println!("[{}] ⛏️ Epoch {} | {} | Difficulty {}", ts(), epoch, backend, difficulty);
         println!("[{}]    Challenge: 0x{}...", ts(), hex_short(challenge.as_slice()));
 
@@ -326,31 +348,46 @@ async fn main() -> Result<()> {
             })
         };
 
-        // Mine
+        // Mine — CUDA > OpenCL > CPU
         let mining_result: Option<U256> = {
             let stop_flag = Arc::clone(&stop_flag);
             let attempts_counter = Arc::clone(&attempts_counter);
 
-            #[cfg(feature = "gpu")]
-            {
-                if let Some(g) = gpu_miner.as_ref().cloned() {
+            let has_cuda = cuda_miner.is_some();
+            let has_opencl = gpu_miner.is_some();
+
+            if has_cuda {
+                let stop_flag = Arc::clone(&stop_flag);
+                let attempts_counter = Arc::clone(&attempts_counter);
+                let res = tokio::task::spawn_blocking(move || {
+                    let miner = cuda::CudaMiner::new().map_err(|e| eyre!("{e}"))?;
+                    miner.mine(challenge, difficulty, start_nonce_u64, stop_flag, attempts_counter)
+                }).await?;
+                match res {
+                    Ok(Some(nonce)) => Some(U256::from(nonce)),
+                    Ok(None) => None,
+                    Err(e) => { eprintln!("[{}] ❌ CUDA: {}", ts(), e); None }
+                }
+            } else if has_opencl {
+                #[cfg(feature = "gpu")]
+                {
+                    let g = gpu_miner.as_ref().cloned().unwrap();
+                    let stop_flag = Arc::clone(&stop_flag);
+                    let attempts_counter = Arc::clone(&attempts_counter);
                     let res = tokio::task::spawn_blocking(move || {
                         g.mine(challenge, difficulty, start_nonce_u64, stop_flag, attempts_counter)
                     }).await?;
                     match res {
                         Ok(Some(nonce)) => Some(U256::from(nonce)),
                         Ok(None) => None,
-                        Err(e) => { eprintln!("[{}] ❌ GPU: {}", ts(), e); None }
+                        Err(e) => { eprintln!("[{}] ❌ OpenCL: {}", ts(), e); None }
                     }
-                } else {
-                    tokio::task::spawn_blocking(move || {
-                        run_workers(challenge, difficulty, start_nonce, stop_flag, attempts_counter, num_threads)
-                    }).await?
                 }
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                let _ = &gpu_miner;
+                #[cfg(not(feature = "gpu"))]
+                {
+                    None
+                }
+            } else {
                 tokio::task::spawn_blocking(move || {
                     run_workers(challenge, difficulty, start_nonce, stop_flag, attempts_counter, num_threads)
                 }).await?

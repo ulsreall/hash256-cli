@@ -2,7 +2,7 @@
 name = "hash256-miner"
 version = "8.0.0"
 edition = "2021"
-description = "High-performance OpenCL GPU miner for HASH256 — fire-and-forget TX with receipt tracking"
+description = "High-performance GPU miner for HASH256 — CUDA + OpenCL + CPU"
 license = "MIT"
 
 [dependencies]
@@ -22,8 +22,8 @@ rpassword = "7"
 num_cpus = "1"
 rand = "0.8"
 dotenvy = "0.15"
-ocl = { version = "0.19", optional = true }
 hex = "0.4"
+ocl = { version = "0.19", optional = true }
 
 [features]
 default = ["gpu"]
