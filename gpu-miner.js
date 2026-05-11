@@ -136,6 +136,8 @@ async function submitMineTx(contract, nonce, gasParams) {
         const msg = err.shortMessage || err.message || String(err);
         if (msg.includes("InsufficientWork") || msg.includes("already mined")) {
           log("⏭️ Already mined — skipping");
+        } else if (msg.includes("missing response") || msg.includes("BAD_DATA")) {
+          log("⏭️ RPC rate limited — TX may still confirm");
         } else {
           log(`✗ TX failed: ${msg.slice(0, 100)}`);
         }
@@ -196,7 +198,9 @@ async function main() {
   console.log(`╚═══════════════════════════════════════════════════════════════╝`);
 
   const provider = new ethers.JsonRpcProvider(RPC_URL);
-  const txProvider = TX_RPC_URL !== RPC_URL ? new ethers.JsonRpcProvider(TX_RPC_URL) : provider;
+  const txProvider = TX_RPC_URL !== RPC_URL
+    ? new ethers.JsonRpcProvider(TX_RPC_URL, undefined, { batchMaxCount: 1 })
+    : provider;
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
   const txWallet = new ethers.Wallet(PRIVATE_KEY, txProvider);
   const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
@@ -283,6 +287,16 @@ process.on("SIGINT", () => {
 process.on("SIGTERM", () => {
   printStats();
   process.exit(0);
+});
+
+process.on("uncaughtException", (err) => {
+  const msg = err.message || String(err);
+  if (msg.includes("missing response") || msg.includes("BAD_DATA")) {
+    log("⏭️ RPC batch error caught — continuing...");
+    return; // don't crash
+  }
+  log(`✗ Uncaught: ${msg}`);
+  process.exit(1);
 });
 
 main().catch(err => {
