@@ -1,180 +1,128 @@
 # HASH256 CLI Miner
 
-CLI miner for **$HASH** — a browser-mined post-quantum token on Ethereum mainnet. Source: [hash256.org](https://hash256.org)
+GPU + CPU CLI miner for **$HASH** — a browser-mined post-quantum token on Ethereum mainnet. Source: [hash256.org](https://hash256.org)
 
-Script ini mengambil challenge dari smart contract, mencari nonce yang memenuhi difficulty target (multi-threaded!), lalu submit transaksi `mine(nonce)` ke Ethereum mainnet.
+## ⚡ Modes
 
-> **v2.1** — Multi-threaded mining via `worker_threads`! Maxes out all CPU cores. Plus colored output, real-time hashrate stats, gas management, graceful shutdown.
+| Mode | Command | Speed | Requirement |
+|------|---------|-------|-------------|
+| **GPU** | `npm run gpu` | ~500+ MH/s | NVIDIA GPU + CUDA |
+| **CPU** | `npm start` | ~5-10 KH/s | Node.js 18+ |
 
 ## ✨ Features
 
-- 🧵 **Multi-threaded mining** — uses all CPU cores via `worker_threads`
-- 🎨 **Colored terminal output** with timestamps and formatted stats
-- ⛏  **Real-time hashrate tracking** with rolling average
-- ⛽ **Gas management** — skip TX if gas too high, auto-wait for drop
-- 📊 **Live stats** — hashes, found, TX success/fail, uptime, CPU load
-- 🔄 **Auto re-challenge** — detects epoch changes and fetches fresh challenge
-- 🪙 **Wallet balance display** — ETH and HASH balance on start
-- 📈 **Supply progress bar** in check-state
+### GPU Miner (CUDA)
+- ⚡ **CUDA keccak-256** — runs PoW directly on GPU, ~100x faster than CPU
+- 🎮 **Auto GPU detection** — picks best GPU, auto-selects architecture
+- 📊 **Real-time hashrate** displayed in stderr
+- 🔄 **Smart retry** — epoch changes, gas management
+
+### CPU Miner (Node.js)
+- 🧵 **Multi-threaded** — uses all CPU cores via `worker_threads`
+- ⛏  **Real-time hashrate** with rolling average
+- 📊 **CPU load display** in stats
+
+### Both Modes
+- 🎨 **Colored terminal output** with timestamps
+- ⛽ **Gas management** — auto-wait if gas too high
+- 🪙 **Wallet balance display** — ETH and HASH on start
 - 🛑 **Graceful shutdown** — Ctrl+C shows final stats
-- 🖥 **CPU info display** — shows CPU model, cores, RAM on start
+- 🔄 **Auto re-challenge** — detects epoch changes
 
 ## ⚠️ Peringatan
 
-- Mining ini memakai **Ethereum mainnet** — butuh ETH untuk gas
-- **Jangan pakai private key wallet utama** — buat wallet baru khusus mining
-- **Jangan commit file `.env`** — sudah di `.gitignore`
+- Mining memakai **Ethereum mainnet** — butuh ETH untuk gas
+- **Jangan pakai private key wallet utama** — buat wallet khusus mining
+- **Jangan commit file `.env`**
 - Verifikasi kontrak: [Etherscan](https://etherscan.io/address/0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc)
 
-## 📦 Kebutuhan
+## 🚀 Quick Start
 
-- Ubuntu / VPS / macOS / Windows (WSL)
-- Node.js 18+
-- npm
-- Wallet Ethereum dengan ETH untuk gas
-- RPC endpoint (gratis: PublicNode, Alchemy, Infura)
-
-## 🚀 Install
-
-### 1. Install Node.js
-
-**Ubuntu/Debian:**
-```bash
-sudo apt update
-sudo apt install -y curl ca-certificates gnupg
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
-sudo apt install -y nodejs
-node -v  # should be v18+
-```
-
-**macOS:**
-```bash
-brew install node
-```
-
-### 2. Setup Project
+### 1. Install
 
 ```bash
 git clone https://github.com/ulsreall/hash256-cli
 cd hash256-cli
 npm install
+```
+
+### 2. Configure
+
+```bash
 cp .env.example .env
 nano .env
 ```
 
-### 3. Configure `.env`
-
+Isi minimal:
 ```env
 RPC_URL=https://ethereum-rpc.publicnode.com
-PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE
+PRIVATE_KEY=0xYOUR_PRIVATE_KEY
 ```
 
-**Optional tuning:**
-```env
-THREADS=4              # Worker threads (default: CPU count - 1)
-BATCH_SIZE=100000      # Hashes per worker progress report
-MAX_GAS_GWEI=50        # Skip TX if gas > this
-GAS_LIMIT=300000       # TX gas limit
-RETRY_DELAY=5000       # Delay on error in ms
+### 3. Run
+
+**GPU Mining** (NVIDIA GPU required):
+```bash
+# Build CUDA binary first
+bash build.sh
+
+# Run
+npm run gpu
 ```
 
-Simpan di nano: `CTRL + X` → `Y` → `Enter`
+**CPU Mining** (any machine):
+```bash
+npm start
+```
 
-## 📊 Cek State Kontrak
-
+**Check contract state:**
 ```bash
 npm run check
 ```
 
-Output:
-```
-──────────────────────────────────────────────────────────
-  🌍 GENESIS STATE
-──────────────────────────────────────────────────────────
-  Total Sold:      1,050,000 HASH
-  Total Raised:    10.5 ETH
-  Complete:        ✓ Yes
+## 🛠 Build GPU Miner
 
-──────────────────────────────────────────────────────────
-  ⛏  MINING STATE
-──────────────────────────────────────────────────────────
-  Era:              Era 1
-  Reward:           100 HASH per mint
-  Total Minted:     12,345
-  Remaining:        18,887,655
+### Prerequisites
+- NVIDIA GPU (RTX 20xx / 30xx / 40xx recommended)
+- CUDA Toolkit 12+
 
-  Supply Progress:
-  [█░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 0.07%
-
-──────────────────────────────────────────────────────────
-  🔑 WALLET
-──────────────────────────────────────────────────────────
-  Address:     0x...
-  ETH Balance:  0.1 ETH
-  HASH Balance: 200 HASH
+### Install CUDA (Ubuntu)
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install -y cuda-toolkit-12-4
 ```
 
-## ⛏ Jalankan Miner
+### Build
+```bash
+bash build.sh
+```
+
+Auto-detects GPU architecture (sm_75 for RTX 20xx, sm_86 for RTX 30xx, etc).
+
+### Supported Architectures
+| GPU | Architecture | Flag |
+|-----|-------------|------|
+| GTX 10xx | Pascal | sm_61 |
+| RTX 20xx | Turing | sm_75 |
+| RTX 30xx / A5000 | Ampere | sm_86 |
+| RTX 40xx | Ada Lovelace | sm_89 |
+| V100 | Volta | sm_70 |
+| A100 | Ampere | sm_80 |
+
+## 🖥 Run di Background
 
 ```bash
-npm start
-```
-
-Contoh output:
-
-```
-  ██╗  ██╗ █████╗ ███████╗██╗  ██╗
-  ██║  ██║██╔══██╗██╔════╝██║  ██║
-  ███████║███████║███████╗███████║
-  ██╔══██║██╔══██║╚════██║██╔══██║
-  ██║  ██║██║  ██║███████║██║  ██║
-  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
-  CLI Miner v2.1 · Ethereum Mainnet · hash256.org
-  4 CPUs · Intel Xeon · 2.0 GB RAM
-
-┌─ Configuration ──────────────────────────────────────────────┐
-│  🔑 Wallet    0x...
-│  📄 Contract  0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc
-│  🧵 Threads   3 / 4 CPUs
-│  ⛽ Max Gas    50 gwei
-│  📦 Gas Limit  300,000
-│  🔄 Batch/Thread 100,000
-└──────────────────────────────────────────────────────────────┘
-
-[10:30:45] 💰 ETH Balance: 0.100000 ETH
-[10:30:45] 🪙 HASH Balance: 0 HASH
-[10:30:46] ⛽ Current Gas: 12.3 gwei
-[10:30:46] ⛏  Mining started with 3 threads! Ctrl+C to stop.
-
-[10:31:00] 🔄 New epoch · fresh challenge loaded
-  Era: 1  │  Reward: 100 HASH  │  Epoch: 1
-  Minted: 12,345  │  Remaining: 18,887,655
-
-──────────────────────────────────────────────────────────────
-  ⛏  Hashrate  5.23 KH/s     │  Hashes  3,140,000        │  Uptime  10m 0s
-  🎯 Found  0                │  TX OK  0                │  TX Fail  0
-  🧵 Threads  3              │  CPU Load  2.85 / 2.90 / 2.70
-──────────────────────────────────────────────────────────────
-
-[10:35:12] 🎯 FOUND nonce: 8472915643
-[10:35:12]    Hash: 0x0000000a3f...
-[10:35:13] 📤 TX sent: https://etherscan.io/tx/0x...
-[10:35:20] ✅ Confirmed in block 19234567
-[10:35:20] 🪙 HASH Balance: 100 HASH
-```
-
-## 🖥 Run di Background (tmux/screen)
-
-```bash
-# Pakai tmux
+# tmux
 tmux new -s hash256
-npm start
+npm run gpu    # atau npm start
 # Detach: CTRL+B, D
 # Reattach: tmux attach -t hash256
 
-# Atau pakai screen
+# screen
 screen -S hash256
-npm start
+npm run gpu
 # Detach: CTRL+A, D
 # Reattach: screen -r hash256
 ```
@@ -185,23 +133,22 @@ npm start
 |----------|---------|-------------|
 | `RPC_URL` | (required) | Ethereum RPC endpoint |
 | `PRIVATE_KEY` | (required) | Wallet private key (0x...) |
-| `THREADS` | CPU count - 1 | Number of mining worker threads |
-| `BATCH_SIZE` | 100000 | Hashes per worker progress report |
+| `THREADS` | CPU count - 1 | Worker threads (CPU miner only) |
+| `BATCH_SIZE` | 100000 | Hashes per worker report (CPU miner) |
 | `MAX_GAS_GWEI` | 50 | Max gas price to submit TX |
 | `GAS_LIMIT` | 300000 | TX gas limit |
-| `RETRY_DELAY` | 5000 | Delay (ms) on error before retry |
+| `RETRY_DELAY` | 5000 | Delay (ms) on error |
 
 ## 🔧 Error Umum
 
 | Error | Penyebab | Solusi |
 |-------|----------|--------|
-| `Missing RPC_URL or PRIVATE_KEY` | `.env` belum diisi | `cp .env.example .env && nano .env` |
-| `PRIVATE_KEY must be valid hex` | Format key salah | Harus `0x` + 64 hex chars |
-| `insufficient funds` | ETH habis | Kirim ETH ke wallet mining |
-| `InsufficientWork` | Nonce sudah expired | Normal — miner auto-retry |
-| `execution reverted` | State berubah | Normal — miner auto-retry |
-| `Gas too high` | Gas > MAX_GAS_GWEI | Miner auto-wait, atau turunkan limit |
-| `npm: command not found` | Node.js belum install | `sudo apt install -y nodejs npm` |
+| `gpu-miner not found` | Belum build | `bash build.sh` |
+| `No CUDA devices` | Gak ada GPU | Pakai `npm start` (CPU) |
+| `Missing RPC_URL` | `.env` kosong | `cp .env.example .env` |
+| `insufficient funds` | ETH habis | Kirim ETH ke wallet |
+| `InsufficientWork` | Nonce expired | Auto-retry |
+| `nvcc not found` | CUDA belum install | Install CUDA toolkit |
 
 ## 📐 Tokenomics
 
@@ -226,8 +173,7 @@ npm start
 - ⛏ [hash256.org/mine](https://hash256.org/mine)
 - 📊 [hash256.org/pool](https://hash256.org/pool)
 - 🐦 [@hash256dotorg](https://x.com/hash256dotorg)
-- 📄 [Whitepaper](https://hash256.org)
-- 📜 [Contract (Etherscan)](https://etherscan.io/address/0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc)
+- 📜 [Contract](https://etherscan.io/address/0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc)
 
 ## 📄 License
 
